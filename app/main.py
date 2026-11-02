@@ -3,7 +3,7 @@ Rodar (na raiz do repositório):  uvicorn app.main:app --reload
 Docs:   http://localhost:8000/docs
 """
 import base64, binascii, csv, hashlib, hmac, io, logging, math, os, secrets, sqlite3, time
-import asyncio, json, sys
+import asyncio, json
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -17,9 +17,11 @@ import psycopg2
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.database import connect_postgres
+from app.migrations import apply_sqlite_migrations
+from app.services import AppServices
 from app.business_schema import SCHEMA as BUSINESS_SCHEMA, MIGRATIONS as BUSINESS_MIGRATIONS
 from app import payroll as hr
 from app import business
@@ -209,9 +211,8 @@ with db() as c:
         c.execute(schema)
     else:
         c.executescript(SCHEMA)
-        for m in MIGRATIONS:                 # bancos criados em versões anteriores
-            try: c.execute(m)
-            except sqlite3.OperationalError: pass
+        c.execute('BEGIN IMMEDIATE')
+        apply_sqlite_migrations(c, MIGRATIONS)
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_nsr ON time_entries(nsr) WHERE nsr IS NOT NULL")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_employee_account_email ON employees(lower(account_email)) WHERE account_email IS NOT NULL AND account_email != ''")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_username ON admins(lower(username)) WHERE username != ''")
@@ -555,7 +556,7 @@ def get_account(who=Depends(principal)):
     return {"email": who["user"], "username": who["name"]}
 
 @app.put("/auth/account")
-def update_account(b: AccountUpdate, who=Depends(principal)):
+def update_account(b: AccountUpdate, who=Depends(principal), authorization: str = Header(default="")):
     if who["role"] != "admin":
         raise HTTPException(403, "Somente o administrador pode editar estes dados da conta.")
     email, username = b.email.strip().lower(), b.username.strip()
@@ -579,6 +580,8 @@ def update_account(b: AccountUpdate, who=Depends(principal)):
         if b.new_password:
             salt = secrets.token_hex(16)
             password_hash = hash_pin(b.new_password, salt)
+            current_token = hashlib.sha256(authorization[7:].encode()).hexdigest()
+            c.execute('DELETE FROM sessions WHERE "user"=? AND token<>?', (old_email, current_token))
         c.execute('UPDATE admins SET "user"=?,username=?,salt=?,hash=? WHERE "user"=?',
                   (email, username, salt, password_hash, old_email))
         c.execute('UPDATE sessions SET "user"=? WHERE "user"=?', (email, old_email))
@@ -760,7 +763,7 @@ def employee_payroll(month: Optional[str] = None, who=Depends(employee_principal
                              (who["employee_id"],)).fetchone()
     if not employee:
         raise HTTPException(401, "Conta de funcionário inativa.")
-    data = business.payroll_data(sys.modules[__name__], ym)
+    data = business.payroll_data(services, ym)
     item = next((e for e in data['employees'] if e['id'] == who['employee_id']), None)
     if item is None:
         raise HTTPException(404, "Sem folha para a competência.")
@@ -898,22 +901,50 @@ def get_totp_status(who=Depends(principal)):
         row = c.execute('SELECT totp_enabled FROM admins WHERE "user"=?', (who["user"],)).fetchone()
     return {"enabled": bool(row["totp_enabled"])}
 
+class TotpSetup(BaseModel):
+    current_password: str = Field(default="", max_length=128)
+    code: str = Field(default="", max_length=6)
+
+
+def pending_totp_key(user):
+    return "totp_pending:" + user
+
+
 @app.post("/auth/2fa/setup")
-def setup_totp(who=Depends(principal)):
+def setup_totp(b: Optional[TotpSetup] = None, who=Depends(principal)):
     if who["role"] not in ("admin", "manager", "operator"):
         raise HTTPException(403, "2FA disponível para contas de gestão.")
     secret = generate_totp_secret()
     with db() as c:
-        c.execute('UPDATE admins SET totp_secret=?,totp_enabled=0 WHERE "user"=?', (secret, who["user"]))
+        account = c.execute('SELECT salt,hash,totp_secret,totp_enabled FROM admins WHERE "user"=?',
+                            (who["user"],)).fetchone()
+        if account["totp_enabled"] and (not b or not hmac.compare_digest(
+                hash_pin(b.current_password, account["salt"]), account["hash"])
+                or not verify_totp(account["totp_secret"], b.code)):
+            raise HTTPException(401, "Informe a senha atual e o código autenticador atual para reconfigurar o 2FA.")
+        pending = json.dumps({"secret": secret, "expires": time.time() + 600, "attempts": 0})
+        c.execute('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',
+                  (pending_totp_key(who["user"]), pending))
     return {"secret": secret, "otpauth_url": provisioning_uri(secret, who["user"])}
 
 @app.post("/auth/2fa/enable")
 def enable_totp(b: TotpCode, who=Depends(principal)):
+    if who["role"] not in ("admin", "manager", "operator"):
+        raise HTTPException(403, "2FA disponível para contas de gestão.")
     with db() as c:
-        row = c.execute('SELECT totp_secret FROM admins WHERE "user"=?', (who["user"],)).fetchone()
-        if not row or not verify_totp(row["totp_secret"], b.code):
+        key = pending_totp_key(who["user"])
+        row = c.execute('SELECT v FROM settings WHERE k=?', (key,)).fetchone()
+        pending = json.loads(row["v"]) if row else None
+        if not pending or pending["expires"] <= time.time() or pending["attempts"] >= 5:
+            raise HTTPException(400, "Configuração expirada. Inicie a configuração do 2FA novamente.")
+        if not verify_totp(pending["secret"], b.code):
+            pending["attempts"] += 1
+            c.execute('UPDATE settings SET v=? WHERE k=?', (json.dumps(pending), key))
+            c.commit()
             raise HTTPException(400, "Código autenticador inválido.")
-        c.execute('UPDATE admins SET totp_enabled=1 WHERE "user"=?', (who["user"],))
+        c.execute('UPDATE admins SET totp_secret=?,totp_enabled=1 WHERE "user"=?',
+                  (pending["secret"], who["user"]))
+        c.execute('DELETE FROM settings WHERE k=?', (key,))
     return {"enabled": True}
 
 @app.post("/auth/2fa/disable")
@@ -923,6 +954,7 @@ def disable_totp(b: TotpCode, who=Depends(principal)):
         if not row or not verify_totp(row["totp_secret"], b.code):
             raise HTTPException(400, "Código autenticador inválido.")
         c.execute('UPDATE admins SET totp_secret=NULL,totp_enabled=0 WHERE "user"=?', (who["user"],))
+        c.execute('DELETE FROM settings WHERE k=?', (pending_totp_key(who["user"]),))
     return {"enabled": False}
 
 class RoleChange(BaseModel):
@@ -1220,6 +1252,13 @@ class EmployeePatch(BaseModel):
     salary: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False); benefits: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False); active: Optional[bool] = None
     department_id: Optional[int] = None
 
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, value):
+        if value is None or not value.strip():
+            raise ValueError('Informe o nome do funcionário.')
+        return value.strip()
+
 @app.post("/employees", dependencies=[Depends(admin)], status_code=201)
 def add_employee(e: EmployeeIn):
     name, email = e.name.strip(), e.account_email.strip().lower()
@@ -1266,9 +1305,15 @@ def export_employees():
 
 @app.patch("/employees/{eid}", dependencies=[Depends(admin)])
 def edit_employee(eid: int, p: EmployeePatch):
-    data = {k: (int(v) if k in ("active", "department_id") else v) for k, v in p.model_dump().items() if v is not None}
+    supplied = p.model_dump(exclude_unset=True)
+    if any(value is None for key, value in supplied.items() if key != 'department_id'):
+        raise HTTPException(422, "Somente o departamento pode ser removido com valor nulo.")
+    data = {key: (int(value) if key in ("active", "department_id") and value is not None else value)
+            for key, value in supplied.items()}
     if not data: raise HTTPException(400, "Nada para atualizar.")
     with db() as c:
+        if data.get('department_id') is not None and not c.execute('SELECT 1 FROM departments WHERE id=?', (data['department_id'],)).fetchone():
+            raise HTTPException(404, "Departamento não encontrado.")
         if 'active' in data and not data['active'] or 'department_id' in data:
             lead = c.execute("SELECT 1 FROM departments WHERE lead_employee_id=?", (eid,)).fetchone()
             manager = c.execute("SELECT 1 FROM admins WHERE employee_id=? AND role='manager'", (eid,)).fetchone()
@@ -1398,12 +1443,22 @@ def timesheet(month: Optional[str] = None):
 # ---------- Folha (integrada ao ponto) ----------
 @app.get("/payroll", dependencies=[Depends(admin)])
 def payroll(month: Optional[str] = None):
-    return business.payroll_data(sys.modules[__name__], month or local(utcnow()).strftime('%Y-%m'))
+    return business.payroll_data(services, month or local(utcnow()).strftime('%Y-%m'))
 
 # ---------- Produtos / custeio ----------
 class ProductIn(BaseModel):
-    name: str; material: float = Field(default=0, ge=0); labor: float = Field(default=0, ge=0)
-    overhead: float = Field(default=0, ge=0); price: float = Field(default=0, ge=0)
+    name: str
+    material: float = Field(default=0, ge=0, allow_inf_nan=False)
+    labor: float = Field(default=0, ge=0, allow_inf_nan=False)
+    overhead: float = Field(default=0, ge=0, allow_inf_nan=False)
+    price: float = Field(default=0, ge=0, allow_inf_nan=False)
+
+class ProductPatch(BaseModel):
+    material: float = Field(default=0, ge=0, allow_inf_nan=False)
+    labor: float = Field(default=0, ge=0, allow_inf_nan=False)
+    overhead: float = Field(default=0, ge=0, allow_inf_nan=False)
+    price: float = Field(default=0, ge=0, allow_inf_nan=False)
+
 
 def with_costs(p):
     cost = p["material"] + p["labor"] + p["overhead"]
@@ -1430,6 +1485,18 @@ def edit_product(pid: int, p: ProductIn):
         cur = c.execute("UPDATE products SET name=?,material=?,labor=?,overhead=?,price=? WHERE id=?",
                         (p.name, p.material, p.labor, p.overhead, p.price, pid))
         if not cur.rowcount: raise HTTPException(404, "Produto não encontrado.")
+    return {"ok": True}
+
+@app.patch("/products/{pid}", dependencies=[Depends(admin)])
+def patch_product(pid: int, payload: ProductPatch):
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(400, "Nada para atualizar.")
+    with db() as c:
+        result = c.execute(f"UPDATE products SET {','.join(key+'=?' for key in changes)} WHERE id=?",
+                           (*changes.values(), pid))
+        if not result.rowcount:
+            raise HTTPException(404, "Produto não encontrado.")
     return {"ok": True}
 
 # ---------- Quadros (tarefas) ----------
@@ -1963,7 +2030,7 @@ def add_tx(t: Tx, who=Depends(admin_context)):
         cur = c.execute("INSERT INTO transactions(kind,description,amount,due,department_id,category,competence) VALUES(?,?,?,?,?,?,?) RETURNING id",
                         (t.kind, t.description, hr.money(t.amount), t.due, t.department_id, "revenue" if t.kind == "receber" else t.category, t.competence or t.due[:7]))
         transaction_id = cur.fetchall()[0]["id"]
-        accounting.sync_transaction(sys.modules[__name__], c, c.execute('SELECT * FROM transactions WHERE id=?',(transaction_id,)).fetchone(),who['user'])
+        accounting.sync_transaction(services, c, c.execute('SELECT * FROM transactions WHERE id=?',(transaction_id,)).fetchone(),who['user'])
     return {"id": transaction_id}
 
 @app.get("/finance", dependencies=[Depends(admin)])
@@ -2021,7 +2088,7 @@ def remove_finance_transactions(ids, who):
         if any(t['paid'] or t['source_key'] for t in selected):
             raise HTTPException(409, 'A limpeza permite somente contas abertas manuais. Pagamentos históricos e contas da folha são preservados.')
         for transaction in selected:
-            accounting.cancel_transaction(sys.modules[__name__],c,transaction['id'],who['user'])
+            accounting.cancel_transaction(services,c,transaction['id'],who['user'])
             c.execute('INSERT INTO audit_log(at,actor,role,action,resource,status,ip) VALUES(?,?,?,?,?,?,?)',
                       (iso(utcnow()), who['user'], who['role'], 'FINANCE_DELETE',
                        json.dumps({'id': transaction['id'], 'description': transaction['description'],
@@ -2046,7 +2113,7 @@ def pay_tx(tid: int, who=Depends(admin_context)):
         if transaction['paid']: return {"ok": True, "already_paid": True}
         at = iso(utcnow())
         c.execute("UPDATE transactions SET paid=1, paid_at=? WHERE id=?", (at, tid))
-        business.record_payment(sys.modules[__name__], c, {**dict(transaction), 'paid_at': at}, who['user'])
+        business.record_payment(services, c, {**dict(transaction), 'paid_at': at}, who['user'])
     return {"ok": True, "already_paid": False}
 
 @app.delete("/finance/{tid}", dependencies=[Depends(admin)])
@@ -2181,7 +2248,7 @@ def edit_material(mid: int, m: MaterialIn, background: BackgroundTasks, who=Depe
             raise HTTPException(404, "Material não encontrado.")
         cur = c.execute("UPDATE materials SET name=?,unit=?,stock=?,unit_cost=?,minimum_stock=? WHERE id=?",
                         (m.name, m.unit, m.stock, m.unit_cost, m.minimum_stock, mid))
-        accounting.event(sys.modules[__name__],c,who,'materials',mid,dict(old),m.model_dump(),'Edição manual de material/custo')
+        accounting.event(services,c,who,'materials',mid,dict(old),m.model_dump(),'Edição manual de material/custo')
     was_low = old["stock"] == 0 or (old["minimum_stock"] > 0 and old["stock"] <= old["minimum_stock"])
     is_low = m.stock == 0 or (m.minimum_stock > 0 and m.stock <= m.minimum_stock)
     if is_low and (not was_low or m.name != old["name"]):
@@ -2283,7 +2350,7 @@ def edit_space(sid: int, s: SpaceIn):
                         (s.name, s.kind, s.admin_email, s.capacity, int(s.allow_shared), sid))
         for existing in c.execute("SELECT * FROM space_bookings WHERE space_id=? AND status NOT IN ('cancelled','completed')", (sid,)).fetchall():
             booking = BookingIn(**{key: existing[key] for key in BookingIn.model_fields})
-            business.check_booking(sys.modules[__name__], c, booking, existing['starts_at'], existing['ends_at'], existing['id'])
+            business.check_booking(services, c, booking, existing['starts_at'], existing['ends_at'], existing['id'])
         if not cur.rowcount: raise HTTPException(404, "Espaço não encontrado.")
     return {"ok": True}
 
@@ -2356,12 +2423,12 @@ def add_space_booking(booking: BookingIn, who=Depends(principal)):
         if department_id is not None and not c.execute("SELECT 1 FROM departments WHERE id=?",
                                                        (department_id,)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
-        business.check_booking(sys.modules[__name__], c, booking, start, end)
+        business.check_booking(services, c, booking, start, end)
         cur = c.execute("INSERT INTO space_bookings(space_id,department_id,title,starts_at,ends_at,booked_by,status,attendees,exclusive,compatibility,details) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
                         (booking.space_id, department_id, title, start, end, who["user"], booking.status, booking.attendees, int(booking.exclusive), booking.compatibility.strip(), booking.details))
         booking_id = cur.fetchone()['id']
-        business.sync_staff(sys.modules[__name__], c, booking_id)
+        business.sync_staff(services, c, booking_id)
         return {"id": booking_id}
 
 @app.patch("/space-bookings/{booking_id}")
@@ -2378,9 +2445,9 @@ def update_space_booking(booking_id: int, booking: BookingIn, who=Depends(princi
         department_id = booking.department_id if who['role']=='admin' else who['department_id']
         if department_id is not None and not c.execute('SELECT 1 FROM departments WHERE id=?', (department_id,)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
-        business.check_booking(sys.modules[__name__], c, booking, start, end, booking_id)
+        business.check_booking(services, c, booking, start, end, booking_id)
         c.execute("UPDATE space_bookings SET space_id=?,department_id=?,title=?,starts_at=?,ends_at=?,status=?,attendees=?,exclusive=?,compatibility=?,details=? WHERE id=?", (booking.space_id, department_id, booking.title.strip(), start, end, booking.status, booking.attendees, int(booking.exclusive), booking.compatibility.strip(), booking.details, booking_id))
-        business.sync_staff(sys.modules[__name__], c, booking_id)
+        business.sync_staff(services, c, booking_id)
     return {"ok": True}
 
 @app.delete("/space-bookings/{booking_id}")
@@ -2399,7 +2466,7 @@ def delete_space_booking(booking_id: int, who=Depends(principal)):
             raise HTTPException(403, "Você só pode cancelar suas próprias reservas.")
         c.execute("BEGIN IMMEDIATE")
         cur = c.execute("UPDATE space_bookings SET status='cancelled' WHERE id=?", (booking_id,))
-        business.sync_staff(sys.modules[__name__], c, booking_id)
+        business.sync_staff(services, c, booking_id)
         if not cur.rowcount:
             raise HTTPException(404, "Agendamento não encontrado.")
     return {"ok": True}
@@ -2611,16 +2678,42 @@ def clock_employees(request: Request):
         verify_clock_ip(request.client.host if request.client else "", settings(c))
         return rows(c.execute("SELECT id,name FROM employees WHERE active=1 ORDER BY name"))
 
-def check_employee(c, employee_id: int, pin: str):
+from threading import Lock
+
+_pin_attempts = {}
+_pin_attempts_lock = Lock()
+PIN_COOLDOWN_SECONDS = 300
+PIN_ORIGIN_MAX_TRIES = 25
+
+
+def check_employee(c, employee_id: int, pin: str, origin: str = "local"):
+    # Limits follow the connection origin, never the employee across all devices.
+    # Do not trust caller-controlled forwarding headers here.
+    now = time.monotonic()
+    keys = ((origin, None), (origin, employee_id))
+    with _pin_attempts_lock:
+        for key in [key for key, (_, until) in _pin_attempts.items() if until <= now]:
+            del _pin_attempts[key]
+        for key, limit in zip(keys, (PIN_ORIGIN_MAX_TRIES, MAX_PIN_TRIES)):
+            if _pin_attempts.get(key, (0, 0))[0] >= limit:
+                raise HTTPException(423, "Muitas tentativas de PIN nesta origem. Aguarde 5 minutos e tente novamente.")
+        # Reserve attempts before expensive hashing so parallel failures cannot
+        # all pass the limit check. The hash itself runs outside the lock.
+        for key in keys:
+            count, until = _pin_attempts.get(key, (0, now + PIN_COOLDOWN_SECONDS))
+            _pin_attempts[key] = (count + 1, until)
     e = c.execute("SELECT * FROM employees WHERE id=? AND active=1", (employee_id,)).fetchone()
     if not e: raise HTTPException(404, "Funcionário não encontrado.")
-    if e["failed_pins"] >= MAX_PIN_TRIES:
-        raise HTTPException(423, "PIN bloqueado por tentativas erradas. Fale com o administrador.")
     if not hmac.compare_digest(hash_pin(pin, e["pin_salt"]), e["pin_hash"]):
-        c.execute("UPDATE employees SET failed_pins=failed_pins+1 WHERE id=?", (e["id"],))
-        c.commit()
         raise HTTPException(401, "PIN incorreto.")
-    c.execute("UPDATE employees SET failed_pins=0 WHERE id=?", (e["id"],))   # também abre a transação de escrita
+    with _pin_attempts_lock:
+        _pin_attempts.pop(keys[1], None)
+        count, until = _pin_attempts.get(keys[0], (1, now + PIN_COOLDOWN_SECONDS))
+        if count > 1:
+            _pin_attempts[keys[0]] = (count - 1, until)
+        else:
+            _pin_attempts.pop(keys[0], None)
+    c.execute("UPDATE employees SET failed_pins=0 WHERE id=?", (e["id"],))
     return e
 
 class Live(BaseModel):
@@ -2652,7 +2745,7 @@ def clock_live(b: Live, request: Request):
     """Chamado a cada poucos segundos pelo aparelho enquanto o funcionário está na tela de ponto.
     Só informa a distância (para o funcionário se posicionar); não grava nada."""
     with db() as c:
-        check_employee(c, b.employee_id, b.pin)
+        check_employee(c, b.employee_id, b.pin, request.client.host if request.client else "unknown")
         configured = settings(c)
         verify_clock_ip(request.client.host if request.client else "", configured)
         w = workplace_of(configured)
@@ -2681,7 +2774,7 @@ class EmployeeClock(BaseModel):
 @app.get("/clock/tasks")
 def clock_tasks(employee_id: int, pin: str, request: Request):
     with db() as c:
-        employee = check_employee(c, employee_id, pin)
+        employee = check_employee(c, employee_id, pin, request.client.host if request.client else "unknown")
         verify_clock_ip(request.client.host if request.client else "", settings(c))
         return rows(c.execute(
             "SELECT id,title,due FROM tasks WHERE status=1 AND (assignee='' OR lower(assignee)=lower(?)) "
@@ -2697,7 +2790,7 @@ def record_clock(b: Clock, request: Request, background: BackgroundTasks,
     now = utcnow(); now_ms = now.timestamp() * 1000
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
-        e = (check_employee(c, b.employee_id, b.pin) if employee_id is None else
+        e = (check_employee(c, b.employee_id, b.pin, request.client.host if request.client else "unknown") if employee_id is None else
              c.execute("SELECT * FROM employees WHERE id=? AND active=1", (employee_id,)).fetchone())
         if not e:
             raise HTTPException(401, "Conta de funcionário inativa.")
@@ -2935,8 +3028,15 @@ def dashboard():
                       "materials": bool(n_mat), "departments": bool(n_dep), "spaces": bool(n_sp)},
             "setup_completed": setup_completed, "dre": dre, "lots": lots}
 
-business.register_routes(sys.modules[__name__])
-accounting.register_routes(sys.modules[__name__])
+services = AppServices(
+    app=app, db=db, admin=admin, admin_context=admin_context, principal=principal,
+    manager_or_admin=manager_or_admin, employee_principal=employee_principal,
+    rows=rows, utcnow=lambda: utcnow(), iso=iso, local=local,
+    day_range=day_range, booking_time=booking_time, timesheet_data=timesheet_data,
+    quote=quote, csv_safe=csv_safe, postgres_url=lambda: SUPABASE_DATABASE_URL,
+)
+business.register_routes(services)
+accounting.register_routes(services)
 
 # ---------- Front end (mesmo domínio da API) ----------
 app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")

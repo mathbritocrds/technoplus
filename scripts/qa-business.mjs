@@ -40,6 +40,10 @@ try {
       await post(`/employees/${employee.id}/account`,{email:'employee@example.test',password:'employee-test-password'});
       for(const [viewport,width,height] of [['desktop',1280,900],['mobile',390,844]]) {
         const context=await browser.newContext({viewport:{width,height},reducedMotion:viewport==='desktop'?'no-preference':'reduce'}),page=await context.newPage();
+        // The fixtures and reporting expectations use October 2026. Keep the
+        // administrator's calendar stable without freezing GPS sample timestamps
+        // in the separate employee and public clock-in contexts below.
+        await page.clock.setFixedTime(new Date('2026-10-10T15:00:00Z'));
         if(process.env.QA_FONT_CSS) await context.route('https://fonts.googleapis.com/**',route=>route.fulfill({contentType:'text/css',body:readFileSync(process.env.QA_FONT_CSS,'utf8')}));
         const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',e=>{if(e.type()==='error')errors.push(e.text()+' '+e.location().url);});
         await page.goto(base,{waitUntil:'networkidle'});
@@ -110,8 +114,15 @@ try {
         const accountDownloadWait=page.waitForEvent('download');await page.getByRole('button',{name:'Exportar CSV',exact:true}).click();const accountDownload=await accountDownloadWait;assert.equal(accountDownload.suggestedFilename(),'financeiro.csv');
         await page.getByRole('button',{name:'Limpar filtros',exact:true}).click();await page.locator('[data-flow-month="2026-10"]').waitFor();
         await page.locator('#fk').selectOption('pagar');await page.locator('#fd').fill('Conta criada '+viewport);await page.locator('#fv').fill('200');await page.locator('#ft').fill('2026-10-15');await page.locator('#fdep').selectOption(String(department.id));await page.locator('#fcategory').selectOption('financial');await page.getByRole('button',{name:'Adicionar lançamento',exact:true}).click();await page.getByRole('cell',{name:'Conta criada '+viewport,exact:true}).waitFor();
-        if(await page.getByRole('button',{name:'Marcar como pago',exact:true}).count()) await page.getByRole('button',{name:'Marcar como pago',exact:true}).first().click();await page.locator('input[aria-label^="Anexar comprovante"]').first().waitFor();
+        await page.getByRole('row').filter({has:page.getByRole('cell',{name:'Conta criada '+viewport,exact:true})}).getByRole('button',{name:'Marcar como pago',exact:true}).click();
+        // Payment timestamps come from the real server clock, independently of
+        // the fixed reporting fixtures in the administrator's browser.
+        const paymentMonth=new Date().toLocaleDateString('sv',{timeZone:'America/Sao_Paulo'}).slice(0,7);
+        await page.getByLabel('Mês da consulta financeira',{exact:true}).fill(paymentMonth);
+        await page.locator('input[aria-label^="Anexar comprovante"]').first().waitFor();
         await page.locator('input[aria-label^="Anexar comprovante"]').first().setInputFiles({name:'comprovante.pdf',mimeType:'application/pdf',buffer:Buffer.from('%PDF-1.7\nQA receipt')});await page.getByRole('button',{name:'comprovante.pdf',exact:true}).last().waitFor();
+        await page.getByLabel('Mês da consulta financeira',{exact:true}).fill('2026-10');
+        await page.locator('[data-flow-month="2026-10"]').waitFor();
         const csv=Buffer.from(`ano;mes;setor_id;categoria;descricao;valor;referencia\n2026;10;${department.id};cost;Importação ${viewport};300,00;qa-${viewport}\n`);
         await page.locator('#dreImportFile').setInputFiles({name:'dre.csv',mimeType:'text/csv',buffer:csv});await page.getByRole('button',{name:'Confirmar importação',exact:true}).click();await page.locator('#taskOverlay').waitFor({state:'hidden'});
         await page.getByRole('cell',{name:'Custos operacionais',exact:true}).first().waitFor();
@@ -152,7 +163,7 @@ try {
         if(viewport==='desktop'){await employeePage.getByRole('button',{name:/Registrar entrada com GPS/}).click();await employeePage.getByRole('button',{name:/Registrar saída com GPS/}).waitFor();}
         assert(await employeePage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Horizontal overflow on employee point');
         await employeePage.screenshot({path:`${output}/sigi-${name}-ponto-${viewport}.png`,fullPage:true});
-        if(viewport==='desktop'){await employeePage.locator('[data-employee-tab="espacos"]').click();await employeePage.locator('#employeeBookingSpace').selectOption({label:'Espaço inicial · gestao'});await employeePage.locator('#employeeBookingTitle').fill('Reserva do colaborador');await employeePage.locator('#employeeBookingStart').fill('2026-10-20T10:00');await employeePage.locator('#employeeBookingEnd').fill('2026-10-20T11:00');await employeePage.getByRole('button',{name:'Reservar recurso',exact:true}).click();await employeePage.getByRole('button',{name:'Editar reserva',exact:true}).waitFor();await employeePage.getByRole('button',{name:'Editar reserva',exact:true}).click();await employeePage.locator('#eventTitle').fill('Reserva atualizada pelo colaborador');await employeePage.getByRole('button',{name:'Salvar e atualizar escala'}).click();await employeePage.getByText('Espaço inicial · Reserva atualizada pelo colaborador',{exact:true}).waitFor();}
+        if(viewport==='desktop'){const reservationMonth=new Date().toISOString().slice(0,7);await employeePage.locator('[data-employee-tab="espacos"]').click();await employeePage.locator('#employeeBookingSpace').selectOption({label:'Espaço inicial · gestao'});await employeePage.locator('#employeeBookingTitle').fill('Reserva do colaborador');await employeePage.locator('#employeeBookingStart').fill(reservationMonth+'-20T10:00');await employeePage.locator('#employeeBookingEnd').fill(reservationMonth+'-20T11:00');await employeePage.getByRole('button',{name:'Reservar recurso',exact:true}).click();await employeePage.getByRole('button',{name:'Editar reserva',exact:true}).waitFor();await employeePage.getByRole('button',{name:'Editar reserva',exact:true}).click();await employeePage.locator('#eventTitle').fill('Reserva atualizada pelo colaborador');await employeePage.getByRole('button',{name:'Salvar e atualizar escala'}).click();await employeePage.getByText('Espaço inicial · Reserva atualizada pelo colaborador',{exact:true}).waitFor();}
         await employeeContext.close();
         if(viewport==='desktop'){
           const reviewContext=await browser.newContext({viewport:{width,height},reducedMotion:'reduce'}),reviewPage=await reviewContext.newPage();

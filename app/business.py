@@ -6,6 +6,8 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Literal
 
+from app.services import AppServices
+
 from fastapi import Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, model_validator
@@ -103,7 +105,7 @@ def profile_for(c, employee_id):
     return {**hr.PROFILE_DEFAULTS, **(dict(row) if row else {})}
 
 
-def payroll_data(m, month, c=None):
+def payroll_data(m: AppServices, month, c=None):
     month_or_error(month)
     if c is None:
         with m.db() as connection:
@@ -140,7 +142,7 @@ def payroll_data(m, month, c=None):
             'total_accrual_cost': hr.money(sum(hr.D(e['accrual_cost']) for e in employees))}
 
 
-def record_payment(m, c, transaction, actor):
+def record_payment(m: AppServices, c, transaction, actor):
     c.execute('INSERT INTO payment_history(transaction_id,kind,description,amount,category,competence,paid_at,actor,department_id,source_key) VALUES(?,?,?,?,?,?,?,?,?,?)',
         (transaction['id'], transaction['kind'], transaction['description'], transaction['amount'],
          transaction['category'], transaction['competence'] or transaction['due'][:7], transaction['paid_at'],
@@ -149,7 +151,7 @@ def record_payment(m, c, transaction, actor):
     sync_payment(m,c,transaction,actor)
 
 
-def check_booking(m, c, booking, start, end, exclude_id=0):
+def check_booking(m: AppServices, c, booking, start, end, exclude_id=0):
     space = c.execute('SELECT * FROM spaces WHERE id=?', (booking.space_id,)).fetchone()
     if not space:
         raise HTTPException(404, 'Espaço não encontrado.')
@@ -170,7 +172,7 @@ def check_booking(m, c, booking, start, end, exclude_id=0):
             raise HTTPException(409, 'Conflito de agenda: capacidade simultânea excedida.')
 
 
-def sync_staff(m, c, booking_id):
+def sync_staff(m: AppServices, c, booking_id):
     booking = c.execute('SELECT * FROM space_bookings WHERE id=?', (booking_id,)).fetchone()
     c.execute('DELETE FROM event_staff_assignments WHERE booking_id=?', (booking_id,))
     if booking['status'] in ('cancelled', 'completed'):
@@ -187,8 +189,20 @@ def sync_staff(m, c, booking_id):
         c.execute('INSERT INTO event_staff_assignments(booking_id,employee_id,duty,starts_at,ends_at) VALUES(?,?,?,?,?)', (booking_id, rule['employee_id'], rule['duty'], start, end))
 
 
-def register_routes(m):
+def register_routes(m: AppServices):
+    """Register each domain with the same explicit service dependencies."""
+    _register_payroll_profile_routes(m)
+    _register_payroll_closing_routes(m)
+    _register_vacation_routes(m)
+    _register_payment_routes(m)
+    from app import financial_reports
+    financial_reports.register_routes(m)
+    _register_event_staff_routes(m)
+
+
+def _register_payroll_profile_routes(m: AppServices):
     app = m.app
+
 
     @app.get('/payroll/rules', dependencies=[Depends(m.admin)])
     def rules(month: str = '2026-01'):
@@ -197,12 +211,14 @@ def register_routes(m):
         except ValueError as exc:
             raise HTTPException(422, str(exc))
 
+
     @app.get('/employees/{eid}/payroll-profile', dependencies=[Depends(m.admin)])
     def get_profile(eid: int):
         with m.db() as c:
             if not c.execute('SELECT 1 FROM employees WHERE id=?', (eid,)).fetchone():
                 raise HTTPException(404, 'Funcionário não encontrado.')
             return profile_for(c, eid)
+
 
     @app.put('/employees/{eid}/payroll-profile', dependencies=[Depends(m.admin)])
     def set_profile(eid: int, profile: PayrollProfile):
@@ -216,6 +232,7 @@ def register_routes(m):
             c.execute(f'INSERT INTO employee_payroll_profiles(employee_id,{keys}) VALUES({",".join("?" for _ in range(len(data)+1))}) ON CONFLICT(employee_id) DO UPDATE SET {updates}', (eid, *data.values()))
         return {'ok': True}
 
+
     @app.get('/employees/{eid}/bonuses/{month}', dependencies=[Depends(m.admin)])
     def get_bonus(eid: int, month: str):
         month_or_error(month)
@@ -224,6 +241,7 @@ def register_routes(m):
                 raise HTTPException(404, 'Funcionário não encontrado.')
             row = c.execute('SELECT * FROM employee_bonuses WHERE employee_id=? AND month=?', (eid, month)).fetchone()
         return dict(row) if row else {'employee_id': eid, 'month': month, 'amount': 0, 'note': ''}
+
 
     @app.put('/employees/{eid}/bonuses/{month}', dependencies=[Depends(m.admin)])
     def set_bonus(eid: int, month: str, bonus: BonusIn, who=Depends(m.admin_context)):
@@ -241,6 +259,11 @@ def register_routes(m):
             c.execute('INSERT INTO employee_bonuses(employee_id,month,amount,note,updated_at,updated_by) VALUES(?,?,?,?,?,?) ON CONFLICT(employee_id,month) DO UPDATE SET amount=excluded.amount,note=excluded.note,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
                       (eid, month, hr.money(bonus.amount), bonus.note.strip(), m.iso(m.utcnow()), who['user']))
         return {'ok': True}
+
+
+def _register_payroll_closing_routes(m: AppServices):
+    app = m.app
+
 
     @app.post('/payroll/close', dependencies=[Depends(m.admin)])
     def close(payload: ClosePayroll, who=Depends(m.admin_context)):
@@ -266,6 +289,7 @@ def register_routes(m):
             from app.accounting import sync_payroll
             sync_payroll(m,c,run_id,month,who['user'])
         return {'id': run_id, 'already_closed': False}
+
 
     @app.get('/payroll/annual-cost', dependencies=[Depends(m.admin)])
     def annual(year: int = 2026):
@@ -294,6 +318,11 @@ def register_routes(m):
                     item[k] = hr.money(item[k])
         return {'year': year, 'closed_months': closed_months, 'employees': list(consolidated.values()), 'total_cost': hr.money(sum(hr.D(e['total']) for e in consolidated.values())), 'total_net': hr.money(sum(hr.D(e['net_total']) for e in consolidated.values())), 'basis': 'Folhas fechadas + projeção das abertas; férias provisionadas separadamente do salário.'}
 
+
+def _register_vacation_routes(m: AppServices):
+    app = m.app
+
+
     @app.post('/employees/{eid}/vacations/quote', dependencies=[Depends(m.admin)])
     def vacation_quote(eid: int, payload: VacationIn):
         try:
@@ -318,6 +347,7 @@ def register_routes(m):
         gross = hr.money(base * hr.D(4)/3 * multiplier)
         return {'base': hr.money(base*multiplier), 'constitutional_third': hr.money(base/3*multiplier), 'gross': gross, 'overdue': cycle['overdue'], 'payment_due': (starts-timedelta(days=2)).isoformat(), 'remaining_days': cycle['remaining_days'], 'note': 'Remuneração bruta de férias. Retenções devem ser apuradas separadamente na data do pagamento.'}
 
+
     @app.post('/employees/{eid}/vacations', dependencies=[Depends(m.admin)], status_code=201)
     def vacation_record(eid: int, payload: VacationIn, who=Depends(m.admin_context)):
         with m.db() as c:
@@ -331,6 +361,11 @@ def register_routes(m):
                     raise HTTPException(409, 'Período de férias já registrado.')
             record_id = c.execute('INSERT INTO vacation_records(employee_id,acquisition_start,days,starts_on,created_at,created_by) VALUES(?,?,?,?,?,?) RETURNING id', (eid, payload.acquisition_start, payload.days, payload.starts_on, m.iso(m.utcnow()), who['user'])).fetchone()['id']
         return {'id': record_id, **quote}
+
+
+def _register_payment_routes(m: AppServices):
+    app = m.app
+
 
     @app.get('/finance/payments', dependencies=[Depends(m.admin)])
     def payments(month: str | None = None, year: int | None = None):
@@ -349,6 +384,7 @@ def register_routes(m):
             for item in items:
                 item['attachments'] = m.rows(c.execute('SELECT id,name,mime,size,sha256,uploaded_at,uploaded_by FROM payment_attachments WHERE payment_id=? ORDER BY id', (item['id'],)))
         return items
+
 
     @app.post('/finance/payments/{payment_id}/attachments', dependencies=[Depends(m.admin)], status_code=201)
     def upload(payment_id: int, file: PaymentFile, who=Depends(m.admin_context)):
@@ -371,6 +407,7 @@ def register_routes(m):
             file_id = c.execute('INSERT INTO payment_attachments(payment_id,name,mime,size,content,sha256,uploaded_at,uploaded_by) VALUES(?,?,?,?,?,?,?,?) RETURNING id', (payment_id, name, file.mime, len(content), base64.b64encode(content).decode(), digest, m.iso(m.utcnow()), who['user'])).fetchone()['id']
         return {'id': file_id, 'name': name, 'sha256': digest}
 
+
     @app.get('/finance/payments/{payment_id}/attachments/{file_id}', dependencies=[Depends(m.admin)])
     def download(payment_id: int, file_id: int):
         with m.db() as c:
@@ -379,13 +416,16 @@ def register_routes(m):
             raise HTTPException(404, 'Comprovante não encontrado.')
         return Response(base64.b64decode(file['content']), media_type=file['mime'], headers={'Content-Disposition': "attachment; filename*=UTF-8''"+m.quote(file['name']), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'})
 
-    from app import financial_reports
-    financial_reports.register_routes(m)
+
+def _register_event_staff_routes(m: AppServices):
+    app = m.app
+
 
     @app.get('/spaces/{sid}/staff-rules', dependencies=[Depends(m.admin)])
     def staff_rules(sid: int):
         with m.db() as c:
             return m.rows(c.execute('SELECT r.*,e.name FROM space_staff_rules r JOIN employees e ON e.id=r.employee_id WHERE space_id=?', (sid,)))
+
 
     @app.post('/spaces/{sid}/staff-rules', dependencies=[Depends(m.admin)], status_code=201)
     def add_staff_rule(sid: int, rule: StaffRule):
@@ -400,6 +440,7 @@ def register_routes(m):
                 sync_staff(m, c, b['id'])
         return {'id': rule_id}
 
+
     @app.delete('/spaces/{sid}/staff-rules/{rule_id}', dependencies=[Depends(m.admin)])
     def delete_staff_rule(sid: int, rule_id: int):
         with m.db() as c:
@@ -409,10 +450,12 @@ def register_routes(m):
                 sync_staff(m, c, b['id'])
         return {'ok': True}
 
+
     @app.get('/space-bookings/{booking_id}/staff')
     def event_staff(booking_id: int, who=Depends(m.manager_or_admin)):
         with m.db() as c:
             return m.rows(c.execute('SELECT a.*,e.name FROM event_staff_assignments a JOIN employees e ON e.id=a.employee_id WHERE booking_id=? ORDER BY starts_at', (booking_id,)))
+
 
     @app.get('/employee/event-shifts')
     def my_shifts(who=Depends(m.employee_principal)):

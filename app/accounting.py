@@ -8,6 +8,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
+from app.services import AppServices
+
 from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
@@ -67,7 +69,7 @@ def json_exact(value):
     return value
 
 
-def event(m, c, who, module, resource, before, after, reason, department_id=None):
+def event(m: AppServices, c, who, module, resource, before, after, reason, department_id=None):
     c.execute('INSERT INTO audit_events(at,actor,role,module,resource_id,department_id,before_json,after_json,reason) VALUES(?,?,?,?,?,?,?,?,?)',
               (m.iso(m.utcnow()), who['user'], who['role'], module, str(resource), department_id,
                json.dumps(before, ensure_ascii=False, default=str), json.dumps(after, ensure_ascii=False, default=str), reason))
@@ -85,10 +87,10 @@ def scoped(who, department_id=None):
 
 
 @contextmanager
-def connection(m, who):
+def connection(m: AppServices, who):
     scoped(who)
     with m.db() as c:
-        if m.SUPABASE_DATABASE_URL:
+        if m.postgres_url():
             # This NOLOGIN/NOBYPASSRLS role is deliberately not the connection owner.
             c.execute('SET LOCAL ROLE sigi_accounting_api')
             c.execute("SELECT set_config('sigi.role',?,true)", (who['role'],))
@@ -96,7 +98,7 @@ def connection(m, who):
         yield c
 
 
-def post(m, c, booked_on, description, department_id, source_key, lines, actor, reverses_id=None):
+def post(m: AppServices, c, booked_on, description, department_id, source_key, lines, actor, reverses_id=None):
     if len(lines) < 2 or any(d < 0 or cr < 0 or max(d,cr)>9223372036854775807 or bool(d) == bool(cr) for _, d, cr in lines):
         raise HTTPException(400, 'Partidas inválidas.')
     if sum(d for _, d, _ in lines) != sum(cr for _, _, cr in lines):
@@ -122,7 +124,7 @@ def post(m, c, booked_on, description, department_id, source_key, lines, actor, 
 CATEGORY_ACCOUNT = {'cost':'5.2.01','operating':'5.3.01','personnel':'5.3.02','tax':'5.1.01','financial':'5.6.01'}
 
 
-def sync_transaction(m, c, t, actor='system'):
+def sync_transaction(m: AppServices, c, t, actor='system'):
     if t['source_key'].startswith('payroll:'):
         return False
     t=dict(t)
@@ -138,7 +140,7 @@ def sync_transaction(m, c, t, actor='system'):
     return created
 
 
-def sync_payment(m, c, t, actor='system'):
+def sync_payment(m: AppServices, c, t, actor='system'):
     sync_transaction(m,c,t,actor)
     amount = cents(t['amount'])
     counterpart = '2.1.03' if t['source_key'].startswith('payroll:') else ('1.1.02' if t['kind']=='receber' else '2.1.01')
@@ -147,7 +149,7 @@ def sync_payment(m, c, t, actor='system'):
     return created
 
 
-def sync_payroll(m,c,run_id,month,actor):
+def sync_payroll(m: AppServices,c,run_id,month,actor):
     created=0
     for row in c.execute('SELECT employee_id,snapshot FROM payroll_items WHERE run_id=?',(run_id,)).fetchall():
         p=json.loads(row['snapshot']); total=cents(p['accrual_cost']); cash=cents(p['company_cost'])
@@ -162,14 +164,14 @@ def sync_payroll(m,c,run_id,month,actor):
     return created
 
 
-def reverse(m,c,journal,booked_on,reason,actor):
+def reverse(m: AppServices,c,journal,booked_on,reason,actor):
     if journal['reverses_id'] or c.execute('SELECT 1 FROM ledger_journals WHERE reverses_id=?',(journal['id'],)).fetchone():
         raise HTTPException(409,'Lançamento já estornado ou de estorno.')
     lines=[(r['account_code'],r['credit_cents'],r['debit_cents']) for r in c.execute('SELECT * FROM ledger_lines WHERE journal_id=? ORDER BY id',(journal['id'],))]
     return post(m,c,booked_on,('Estorno · '+reason)[:300],journal['department_id'],f"reversal:{journal['id']}",lines,actor,journal['id'])[0]
 
 
-def cancel_transaction(m,c,tid,actor):
+def cancel_transaction(m: AppServices,c,tid,actor):
     transaction=c.execute('SELECT ledger_ref FROM transactions WHERE id=?',(tid,)).fetchone()
     journal=c.execute('SELECT * FROM ledger_journals WHERE source_key=?',(f"transaction:{transaction['ledger_ref']}",)).fetchone()
     if journal:
@@ -185,7 +187,7 @@ def period(start,end):
     return str(a),str(b)
 
 
-def balances(m,c,start,end,department_id):
+def balances(m: AppServices,c,start,end,department_id):
     where,params='j.status=\'posted\' AND j.booked_on<=?', [end]
     if department_id is not None: where+=' AND j.department_id=?';params.append(department_id)
     # Aggregation is done in SQL; raw postings are never downloaded for reports.
@@ -222,7 +224,7 @@ def statement(totals):
              'subtotal':label.startswith('(=)'), 'revenue_pct':round(amount/t('revenue')*100,2) if t('revenue') else None} for key,label,amount,required in rows]
 
 
-def report(m,c,start,end,department_id):
+def report(m: AppServices,c,start,end,department_id):
     items=balances(m,c,start,end,department_id);totals={}
     for item in items:
         if item['dre_category']:
@@ -244,11 +246,23 @@ def report(m,c,start,end,department_id):
                      'balanced':debit==credit and sum(r['closing'] for r in items)==0}}
 
 
-def register_routes(m):
-    app=m.app
+def register_routes(m: AppServices):
+    """Register each domain with the same explicit service dependencies."""
+    _register_journal_routes(m)
+    _register_report_routes(m)
+    _register_audit_routes(m)
+    _register_time_adjustment_routes(m)
+    _register_integration_routes(m)
+
+
+def _register_journal_routes(m: AppServices):
+    app = m.app
+
+
     @app.get('/accounting/accounts')
     def accounts(who=Depends(m.manager_or_admin)):
         with connection(m,who) as c: return m.rows(c.execute('SELECT * FROM ledger_accounts ORDER BY code'))
+
 
     @app.post('/accounting/journals',status_code=201)
     def create(payload:Journal,who=Depends(m.manager_or_admin)):
@@ -263,10 +277,43 @@ def register_routes(m):
             if new: event(m,c,who,'journal',jid,{},payload.model_dump(),'Escrituração manual',department)
         return {'id':jid,'created':new}
 
+
+    @app.get('/accounting/journals')
+    def journals(start:str,end:str,page:int=Query(1,ge=1),page_size:int=Query(20,ge=1,le=100),department_id:int|None=None,who=Depends(m.manager_or_admin)):
+        start,end=period(start,end);department=scoped(who,department_id)
+        where,params="j.status='posted' AND j.booked_on>=? AND j.booked_on<=?",[start,end]
+        if department is not None:where+=' AND j.department_id=?';params.append(department)
+        with connection(m,who) as c:
+            total=c.execute('SELECT COUNT(*) FROM ledger_journals j WHERE '+where,params).fetchone()[0]
+            items=m.rows(c.execute('SELECT j.*,EXISTS(SELECT 1 FROM ledger_journals r WHERE r.reverses_id=j.id) AS reversed FROM ledger_journals j WHERE '+where+' ORDER BY j.booked_on DESC,j.id DESC LIMIT ? OFFSET ?',(*params,page_size,(page-1)*page_size)))
+            for item in items:item['lines']=m.rows(c.execute('SELECT l.*,a.name FROM ledger_lines l JOIN ledger_accounts a ON a.code=l.account_code WHERE journal_id=? ORDER BY l.id',(item['id'],)))
+        return {'items':items,'total':total,'page':page,'page_size':page_size}
+
+
+    @app.post('/accounting/journals/{jid}/reverse')
+    def reversal(jid:int,payload:Reversal,who=Depends(m.manager_or_admin)):
+        payload.reason=payload.reason.strip()
+        if len(payload.reason)<5:raise HTTPException(400,'Informe o motivo do estorno.')
+        department=scoped(who)
+        with connection(m,who) as c:
+            c.execute('BEGIN IMMEDIATE');j=c.execute('SELECT * FROM ledger_journals WHERE id=?',(jid,)).fetchone()
+            if not j or (department is not None and j['department_id']!=department):raise HTTPException(404,'Lançamento não encontrado.')
+            if not j['source_key'].startswith('manual:'):raise HTTPException(409,'Corrija a origem operacional para manter a integração consistente.')
+            if payload.booked_on<date.fromisoformat(j['booked_on']):raise HTTPException(400,'Estorno não pode anteceder o lançamento original.')
+            rid=reverse(m,c,j,payload.booked_on,payload.reason,who['user'])
+            event(m,c,who,'reversal',jid,dict(j),{'reversal_id':rid},payload.reason,j['department_id'])
+        return {'id':rid}
+
+
+def _register_report_routes(m: AppServices):
+    app = m.app
+
+
     @app.get('/accounting/reports')
     def reports(start:str,end:str,department_id:int|None=None,who=Depends(m.manager_or_admin)):
         start,end=period(start,end);department=scoped(who,department_id)
         with connection(m,who) as c: return json_exact(report(m,c,start,end,department))
+
 
     @app.get('/accounting/export.csv')
     def export(start:str,end:str,kind:Literal['dre','balance','trial']='dre',department_id:int|None=None,who=Depends(m.manager_or_admin)):
@@ -290,30 +337,10 @@ def register_routes(m):
             w.writerow(['Totais','','',money(result['trial']['debit_cents']),money(result['trial']['credit_cents'])])
         return Response(out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{kind}-{start}-{end}.csv"','Cache-Control':'private, no-store'})
 
-    @app.get('/accounting/journals')
-    def journals(start:str,end:str,page:int=Query(1,ge=1),page_size:int=Query(20,ge=1,le=100),department_id:int|None=None,who=Depends(m.manager_or_admin)):
-        start,end=period(start,end);department=scoped(who,department_id)
-        where,params="j.status='posted' AND j.booked_on>=? AND j.booked_on<=?",[start,end]
-        if department is not None:where+=' AND j.department_id=?';params.append(department)
-        with connection(m,who) as c:
-            total=c.execute('SELECT COUNT(*) FROM ledger_journals j WHERE '+where,params).fetchone()[0]
-            items=m.rows(c.execute('SELECT j.*,EXISTS(SELECT 1 FROM ledger_journals r WHERE r.reverses_id=j.id) AS reversed FROM ledger_journals j WHERE '+where+' ORDER BY j.booked_on DESC,j.id DESC LIMIT ? OFFSET ?',(*params,page_size,(page-1)*page_size)))
-            for item in items:item['lines']=m.rows(c.execute('SELECT l.*,a.name FROM ledger_lines l JOIN ledger_accounts a ON a.code=l.account_code WHERE journal_id=? ORDER BY l.id',(item['id'],)))
-        return {'items':items,'total':total,'page':page,'page_size':page_size}
 
-    @app.post('/accounting/journals/{jid}/reverse')
-    def reversal(jid:int,payload:Reversal,who=Depends(m.manager_or_admin)):
-        payload.reason=payload.reason.strip()
-        if len(payload.reason)<5:raise HTTPException(400,'Informe o motivo do estorno.')
-        department=scoped(who)
-        with connection(m,who) as c:
-            c.execute('BEGIN IMMEDIATE');j=c.execute('SELECT * FROM ledger_journals WHERE id=?',(jid,)).fetchone()
-            if not j or (department is not None and j['department_id']!=department):raise HTTPException(404,'Lançamento não encontrado.')
-            if not j['source_key'].startswith('manual:'):raise HTTPException(409,'Corrija a origem operacional para manter a integração consistente.')
-            if payload.booked_on<date.fromisoformat(j['booked_on']):raise HTTPException(400,'Estorno não pode anteceder o lançamento original.')
-            rid=reverse(m,c,j,payload.booked_on,payload.reason,who['user'])
-            event(m,c,who,'reversal',jid,dict(j),{'reversal_id':rid},payload.reason,j['department_id'])
-        return {'id':rid}
+def _register_audit_routes(m: AppServices):
+    app = m.app
+
 
     @app.get('/accounting/audit')
     def audit(page:int=Query(1,ge=1),page_size:int=Query(20,ge=1,le=100),department_id:int|None=None,who=Depends(m.manager_or_admin)):
@@ -322,6 +349,11 @@ def register_routes(m):
             total=c.execute('SELECT COUNT(*) FROM audit_events'+where,params).fetchone()[0]
             items=m.rows(c.execute('SELECT * FROM audit_events'+where+' ORDER BY id DESC LIMIT ? OFFSET ?',(*params,page_size,(page-1)*page_size)))
         return {'items':items,'total':total,'page':page,'page_size':page_size}
+
+
+def _register_time_adjustment_routes(m: AppServices):
+    app = m.app
+
 
     @app.post('/time-entries/{eid}/adjustments',status_code=201)
     def adjust(eid:int,payload:Adjustment,who=Depends(m.manager_or_admin)):
@@ -343,6 +375,11 @@ def register_routes(m):
             aid=c.execute('INSERT INTO time_entry_adjustments(entry_id,corrected_at,reason,created_at,created_by,department_id) VALUES(?,?,?,?,?,?) RETURNING id',(eid,corrected,payload.reason,m.iso(m.utcnow()),who['user'],old['department_id'])).fetchone()['id']
             event(m,c,who,'time_entry',eid,{'at':old['effective_at'],'original_at':old['at']},{'at':corrected,'adjustment_id':aid},payload.reason,old['department_id'])
         return {'id':aid,'original_at':old['at'],'effective_at':corrected}
+
+
+def _register_integration_routes(m: AppServices):
+    app = m.app
+
 
     @app.post('/accounting/integrate')
     def integrate(payload:Integration,who=Depends(m.admin_context)):

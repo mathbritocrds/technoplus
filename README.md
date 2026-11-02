@@ -58,6 +58,11 @@ O esquema está em [`supabase/schema.sql`](supabase/schema.sql), com RLS ativado
 
 Os administradores configuram 2FA, funções, auditoria e destinos em **Segurança**. A conta principal de administrador não pode ser rebaixada. O código TOTP é válido por janelas curtas; guarde a chave de configuração em local seguro.
 
+Reconfigurar um 2FA já ativo exige a senha e o código autenticador atuais; a proteção anterior permanece válida até confirmar o novo autenticador. A configuração pendente expira em dez minutos e aceita até cinco tentativas de confirmação. Ao alterar a senha administrativa, as outras sessões são encerradas; a sessão usada na alteração permanece ativa.
+
+O ponto limita tentativas de PIN por endereço de conexão: cinco por funcionário e 25 no total por origem, durante cinco minutos. O limite expira automaticamente e não bloqueia o funcionário nas outras origens. Os contadores ficam na memória do processo: instalações com vários processos devem usar um limitador compartilhado; dispositivos sob o mesmo endereço de rede compartilham o limite. Não confie em cabeçalhos de IP enviados pelo cliente ao configurar proxies.
+
+
 Para habilitar envios reais, configure os segredos no ambiente do servidor (nunca no navegador ou no Git):
 
 - E-mail: `SMTP_HOST`, `SMTP_PORT` (padrão `587`), `SMTP_USER`, `SMTP_PASSWORD` e `SMTP_FROM`.
