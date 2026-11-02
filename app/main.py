@@ -694,7 +694,14 @@ def manager_or_admin(who: dict = Depends(principal)):
 def auth_status():
     with db() as c:
         setup_required = not c.execute("SELECT 1 FROM admins LIMIT 1").fetchone()
-    return {"setup_required": setup_required}
+        account = None if setup_required else c.execute(
+            'SELECT "user",username FROM admins WHERE role=\'admin\' LIMIT 1'
+        ).fetchone()
+    return {
+        "setup_required": setup_required,
+        "username": account["username"] if account and account["username"] else "",
+        "email": account["user"] if account else "",
+    }
 
 @app.post("/auth/register", status_code=201)
 def register_account(b: Registration, authorization: str = Header(default="")):
