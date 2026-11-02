@@ -11,7 +11,8 @@ if (process.argv[2] === 'stop') process.exit(0);
 if (!existsSync('dist/sigi/app/main.py')) throw new Error('Run npm run build first.');
 mkdirSync('data', { recursive: true });
 const log = openSync('dist/sigi-preview.log', 'a');
-const child = spawn('python', ['-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8081'], {cwd:resolve('dist/sigi'),env:{...process.env,DB_PATH:resolve('data/flux.db')},detached:true,stdio:['ignore',log,log]});
+const previewPython = existsSync('.venv/bin/python') ? resolve('.venv/bin/python') : 'python';
+const child = spawn(previewPython, ['-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8081'], {cwd:resolve('dist/sigi'),env:{...process.env,DB_PATH:resolve('data/flux.db')},detached:true,stdio:['ignore',log,log]});
 writeFileSync(pidPath,String(child.pid));child.unref();
 for (let i=0;i<40;i++) { try { const r=await fetch('http://127.0.0.1:8081/docs'); if(r.ok){console.log('SIGI production preview ready');process.exit(0);} }catch{} await new Promise(r=>setTimeout(r,250)); }
 throw new Error('Production preview failed; inspect dist/sigi-preview.log.');

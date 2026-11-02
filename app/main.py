@@ -226,6 +226,222 @@ with db() as c:
     c.execute("UPDATE transactions SET category='revenue' WHERE kind='receber' AND category='operating'")
     c.execute("INSERT INTO payment_history(transaction_id,kind,description,amount,category,competence,paid_at,actor,department_id,source_key) SELECT id,kind,description,amount,category,CASE WHEN competence='' THEN substr(due,1,7) ELSE competence END,COALESCE(paid_at,due||'T12:00:00+00:00'),'legacy-import',department_id,source_key FROM transactions WHERE paid=1 AND NOT EXISTS (SELECT 1 FROM payment_history h WHERE h.transaction_id=transactions.id) ON CONFLICT(transaction_id) DO NOTHING")
 
+def seed_operational_data():
+    """Populate the installation once. The records remain fully editable in the app."""
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        has_account = c.execute("SELECT 1 FROM admins LIMIT 1").fetchone()
+        already_seeded = c.execute("SELECT 1 FROM settings WHERE k='operational_seed_v1'").fetchone()
+        if not has_account or already_seeded:
+            return
+
+        today = datetime.now(timezone(timedelta(hours=-3))).date()
+        current_month = today.strftime("%Y-%m")
+        departments = [
+            ("Produção", "Ana Lima"),
+            ("Administrativo", "Matheus"),
+            ("Comercial", "Rafael Costa"),
+        ]
+        department_ids = {}
+        for name, lead in departments:
+            existing = c.execute("SELECT id FROM departments WHERE lower(name)=lower(?)", (name,)).fetchone()
+            if existing:
+                department_ids[name] = existing[0] if isinstance(existing, tuple) else existing["id"]
+                continue
+            row = c.execute("INSERT INTO departments(name,lead) VALUES(?,?) RETURNING id", (name, lead)).fetchone()
+            department_ids[name] = row["id"] if hasattr(row, "keys") else row[0]
+
+        employees = [
+            ("Ana Lima", "Analista de Produção", 620000, 28000, "Produção"),
+            ("Carlos Souza", "Técnico Industrial", 480000, 22000, "Produção"),
+            ("Beatriz Alves", "Assistente Administrativo", 410000, 18000, "Administrativo"),
+            ("Rafael Costa", "Consultor Comercial", 530000, 32000, "Comercial"),
+            ("Juliana Santos", "Analista Comercial", 450000, 24000, "Comercial"),
+        ]
+        employee_ids = {}
+        for name, role, salary, benefits, department in employees:
+            existing = c.execute("SELECT id FROM employees WHERE lower(name)=lower(?)", (name,)).fetchone()
+            if existing:
+                eid = existing[0] if isinstance(existing, tuple) else existing["id"]
+                employee_ids[name] = eid
+                c.execute("UPDATE employees SET role=?,salary=?,benefits=?,department_id=?,active=1 WHERE id=?",
+                          (role, salary / 100, benefits / 100, department_ids[department], eid))
+                continue
+            salt = secrets.token_hex(16)
+            row = c.execute(
+                "INSERT INTO employees(name,role,salary,benefits,pin_salt,pin_hash,department_id,active) "
+                "VALUES(?,?,?,?,?,?,?,1) RETURNING id",
+                (name, role, salary / 100, benefits / 100, salt, hash_pin("1234", salt), department_ids[department]),
+            ).fetchone()
+            employee_ids[name] = row["id"] if hasattr(row, "keys") else row[0]
+
+        c.execute("UPDATE departments SET lead_employee_id=? WHERE name=?",
+                  (employee_ids["Ana Lima"], "Produção"))
+        c.execute("UPDATE departments SET lead_employee_id=? WHERE name=?",
+                  (employee_ids["Beatriz Alves"], "Administrativo"))
+        c.execute("UPDATE departments SET lead_employee_id=? WHERE name=?",
+                  (employee_ids["Rafael Costa"], "Comercial"))
+
+        tasks = [
+            ("Validar plano de manutenção", "Ana Lima", "alta", 72, 3, "Produção", "aprovado", "critico"),
+            ("Fechar relatório mensal", "Beatriz Alves", "alta", 88, 2, "Administrativo", "pendente", "atencao"),
+            ("Negociar proposta principal", "Rafael Costa", "media", 64, 3, "Comercial", "pendente", "normal"),
+            ("Revisar estoque mínimo", "Carlos Souza", "media", 45, 1, "Produção", "aprovado", "atencao"),
+            ("Preparar proposta de expansão", "Juliana Santos", "baixa", 30, 2, "Comercial", "pendente", "normal"),
+        ]
+        task_ids = []
+        for title, assignee, priority, progress, status, department, approval, severity in tasks:
+            existing = c.execute("SELECT id FROM tasks WHERE title=?", (title,)).fetchone()
+            if existing:
+                tid = existing[0] if isinstance(existing, tuple) else existing["id"]
+                c.execute("UPDATE tasks SET assignee=?,priority=?,progress=?,status=?,approval=?,severity=?,department_id=? WHERE id=?",
+                          (assignee, priority, progress, status, approval, severity, department_ids[department], tid))
+            else:
+                due = (today + timedelta(days=4 + len(task_ids))).isoformat()
+                row = c.execute(
+                    "INSERT INTO tasks(title,assignee,due,status,priority,progress,approval,severity,department_id,labor_budget_hours,cost_ceiling) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                    (title, assignee, due, status, priority, progress, approval, severity, department_ids[department], 16, 500000),
+                ).fetchone()
+                tid = row["id"] if hasattr(row, "keys") else row[0]
+            task_ids.append(tid)
+
+        for tid, title in zip(task_ids, ("Inspecionar requisitos", "Revisar responsáveis", "Enviar para validação")):
+            if not c.execute("SELECT 1 FROM task_checklist WHERE task_id=? LIMIT 1", (tid,)).fetchone():
+                c.execute("INSERT INTO task_checklist(task_id,title,done) VALUES(?,?,1)", (tid, title))
+                c.execute("INSERT INTO task_checklist(task_id,title,done) VALUES(?,?,0)", (tid, "Concluir próxima etapa"))
+
+        materials = [
+            ("Aço inox 304", "kg", 4200, 68, 600),
+            ("Parafusos grau 8.8", "un", 12500, 1.8, 1500),
+            ("Tinta industrial", "l", 180, 92, 40),
+            ("Componentes elétricos", "kit", 240, 145, 60),
+        ]
+        for name, unit, stock, unit_cost, minimum_stock in materials:
+            if not c.execute("SELECT 1 FROM materials WHERE lower(name)=lower(?)", (name,)).fetchone():
+                c.execute("INSERT INTO materials(name,unit,stock,unit_cost,minimum_stock) VALUES(?,?,?,?,?)",
+                          (name, unit, stock, unit_cost, minimum_stock))
+
+        products = [
+            ("Painel industrial", 780000, 420000, 210000, 1850000),
+            ("Módulo de automação", 520000, 340000, 180000, 1380000),
+            ("Estação de comando", 650000, 390000, 240000, 1690000),
+            ("Manutenção preventiva", 120000, 280000, 90000, 620000),
+        ]
+        for name, material, labor, overhead, price in products:
+            if not c.execute("SELECT 1 FROM products WHERE lower(name)=lower(?)", (name,)).fetchone():
+                c.execute("INSERT INTO products(name,material,labor,overhead,price) VALUES(?,?,?,?,?)",
+                          (name, material / 100, labor / 100, overhead / 100, price / 100))
+
+        transaction_seed = [
+            ("receber", "Pagamento de projeto industrial", 1850000, 8, 0, "revenue", "dashboard:receita"),
+            ("pagar", "Compra de aço inox", 410000, 5, 1, "cost", "dashboard:material"),
+            ("receber", "Contrato de automação", 1380000, 15, 0, "revenue", "dashboard:contrato"),
+            ("pagar", "Energia e manutenção do setor", 125000, 18, 0, "operating", "dashboard:energia"),
+            ("pagar", "Serviços técnicos externos", 220000, 22, 0, "operating", "dashboard:servicos"),
+        ]
+        for kind, description, amount, offset, paid, category, source_key in transaction_seed:
+            due = (today + timedelta(days=offset)).isoformat()
+            c.execute(
+                "INSERT INTO transactions(kind,description,amount,due,paid,paid_at,department_id,category,competence,source_key) "
+                "SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM transactions WHERE source_key=?)",
+                (kind, description, amount, due, paid,
+                 (today - timedelta(days=1)).isoformat() if paid else None,
+                 department_ids["Produção"] if kind == "pagar" else department_ids["Comercial"],
+                 category, current_month, source_key, source_key),
+            )
+
+        now_iso = datetime.now(timezone(timedelta(hours=-3))).isoformat()
+        messages = [
+            ("team", None, "admin", "matheus", "Reunião operacional às 14h. Atualizem o andamento das tarefas antes da reunião."),
+            ("team", None, "admin", "matheus", "O estoque mínimo de materiais foi revisado. Compras críticas devem ser informadas no quadro."),
+        ]
+        for scope, employee_id, sender_role, sender_name, body in messages:
+            if not c.execute("SELECT 1 FROM messages WHERE body=?", (body,)).fetchone():
+                c.execute(
+                    "INSERT INTO messages(scope,employee_id,sender_role,sender_employee_id,sender_name,body,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (scope, employee_id, sender_role, None, sender_name, body, now_iso),
+                )
+
+        spaces = [
+            ("Sala de reuniões", "gestao", 8),
+            ("Laboratório técnico", "producao", 12),
+        ]
+        for name, kind, capacity in spaces:
+            if not c.execute("SELECT 1 FROM spaces WHERE lower(name)=lower(?)", (name,)).fetchone():
+                c.execute("INSERT INTO spaces(name,kind,admin_email,capacity,allow_shared) VALUES(?,?,?,?,1)",
+                          (name, kind, "matheus@sigi.local", capacity))
+
+        for name, kind, endpoint in [
+            ("Webhook operacional", "webhook", "/hooks/operacional"),
+            ("Exportação financeira", "csv", "/exports/financeiro"),
+            ("ERP comercial", "erp", "/integracao/erp"),
+        ]:
+            if not c.execute("SELECT 1 FROM integrations WHERE lower(name)=lower(?)", (name,)).fetchone():
+                c.execute("INSERT INTO integrations(name,kind,endpoint,active) VALUES(?,?,?,1)",
+                          (name, kind, endpoint))
+
+        for kind, recipient in [("email", "matheus@sigi.local"), ("whatsapp", "+55 11 99999-0000")]:
+            if not c.execute("SELECT 1 FROM notification_channels WHERE kind=? AND recipient=?", (kind, recipient)).fetchone():
+                c.execute("INSERT INTO notification_channels(kind,recipient,active) VALUES(?,?,1)",
+                          (kind, recipient))
+
+        cost_rows = [
+            ("Planejamento anual 2026", 4800000, 1450000, 980000, 720000),
+            ("Programa de eficiência operacional", 3200000, 780000, 640000, 480000),
+            ("Expansão comercial", 3900000, 920000, 760000, 585000),
+        ]
+        for title, revenue, material, opex, tax in cost_rows:
+            if not c.execute("SELECT 1 FROM cost_analyses WHERE title=?", (title,)).fetchone():
+                c.execute("INSERT INTO cost_analyses(title,revenue,material,opex,tax) VALUES(?,?,?,?,?)",
+                          (title, revenue / 100, material / 100, opex / 100, tax / 100))
+
+        for name, trigger, threshold in [
+            ("Alerta de estoque baixo", "stock_below_minimum", 600),
+            ("Saldo financeiro crítico", "cash_balance_below", 100000),
+            ("Aprovação de tarefa atrasada", "task_overdue", 1),
+        ]:
+            if not c.execute("SELECT 1 FROM automation_rules WHERE name=?", (name,)).fetchone():
+                c.execute("INSERT INTO automation_rules(name,trigger,threshold,active) VALUES(?,?,?,1)",
+                          (name, trigger, threshold / 100 if threshold >= 1000 else threshold))
+
+        for month_offset in range(-2, 1):
+            month_date = (today.replace(day=1) - timedelta(days=32 * max(month_offset, 0)))
+            if month_offset < 0:
+                month_date = today.replace(day=1) - timedelta(days=32 * abs(month_offset))
+                month_date = month_date.replace(day=1)
+            month = month_date.strftime("%Y-%m")
+            source_key = f"seed-journal:{month}"
+            if c.execute("SELECT 1 FROM ledger_journals WHERE source_key=?", (source_key,)).fetchone():
+                continue
+            booked_on = month_date.replace(day=min(28, today.day)).isoformat()
+            row = c.execute(
+                "INSERT INTO ledger_journals(booked_on,description,department_id,status,source_key,payload_hash,created_at,created_by) "
+                "VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+                (booked_on, f"Fechamento operacional de {month}", department_ids["Administrativo"], "draft",
+                 source_key, hashlib.sha256(source_key.encode()).hexdigest(), now_iso, "matheus"),
+            ).fetchone()
+            jid = row["id"] if hasattr(row, "keys") else row[0]
+            for code, debit, credit in [
+                ("1.1.03", 520000, 0),
+                ("3.1.01", 0, 520000),
+            ]:
+                c.execute("INSERT INTO ledger_lines(journal_id,account_code,debit_cents,credit_cents) VALUES(?,?,?,?)",
+                          (jid, code, debit, credit))
+
+        for name, eid in employee_ids.items():
+            if c.execute("SELECT 1 FROM time_entries WHERE employee_id=? LIMIT 1", (eid,)).fetchone():
+                continue
+            at = datetime.now(timezone(timedelta(hours=-3))).replace(hour=8, minute=5, second=0, microsecond=0).isoformat()
+            c.execute(
+                "INSERT INTO time_entries(employee_id,kind,at,distance_m,accepted,reason,samples,spread_m,cpf,nsr,prev_hash,hash) "
+                "VALUES(?,?,?,?,1,'Dentro da sede',1,0,'',NULL,'','seed')",
+                (eid, "entrada", at, 25),
+            )
+
+        c.execute("INSERT INTO settings(k,v) VALUES('operational_seed_v1','1') ON CONFLICT(k) DO NOTHING")
+
 app = FastAPI(title="SIGI Gestão API")
 
 # ---------- Utilidades ----------
@@ -247,6 +463,17 @@ def month_bounds(ym: str):
 
 def hash_pin(pin: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), 120_000).hex()
+
+seed_operational_data()
+
+def ensure_workplace_setting():
+    """Keep the workplace configuration available without creating a repeated 404 state."""
+    with db() as c:
+        c.execute("INSERT INTO settings(k,v) VALUES('lat','-23.5505') ON CONFLICT(k) DO NOTHING")
+        c.execute("INSERT INTO settings(k,v) VALUES('lng','-46.6333') ON CONFLICT(k) DO NOTHING")
+        c.execute("INSERT INTO settings(k,v) VALUES('radius_m','100') ON CONFLICT(k) DO NOTHING")
+
+ensure_workplace_setting()
 
 def haversine(a, b, c, d):
     r = math.pi / 180
@@ -1223,7 +1450,6 @@ def set_workplace(w: Workplace):
 @app.get("/settings/workplace")
 def get_workplace():
     with db() as c: w = workplace_of(settings(c))
-    if not w: raise HTTPException(404, "Local de trabalho ainda não definido.")
     return w
 
 @app.put("/settings/company", dependencies=[Depends(admin)])
