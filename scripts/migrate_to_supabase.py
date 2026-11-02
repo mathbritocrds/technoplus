@@ -52,6 +52,11 @@ TABLES = (
     "ledger_lines",
     "audit_events",
     "time_entry_adjustments",
+    "payroll_adjustments",
+    "accounting_periods",
+    "bank_entries",
+    "bank_matches",
+    "compliance_records",
 )
 
 

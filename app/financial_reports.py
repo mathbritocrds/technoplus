@@ -54,6 +54,9 @@ def report(m, start, end, who, department_id=None, category=None):
             for item in c.execute('SELECT employee_id,snapshot FROM payroll_items WHERE run_id=?', (run['id'],)):
                 p=json.loads(item['snapshot'])
                 entries.append(dict(origin='payroll',reference=f"{run['id']}:{item['employee_id']}",month=run['month'],department_id=p['department_id'],category='personnel',description='Folha fechada · '+p['name'],amount=p['accrual_cost']))
+        for adjustment in c.execute('SELECT id,month,delta_json FROM payroll_adjustments WHERE month>=? AND month<=?', (start,end)):
+            for item in json.loads(adjustment['delta_json']):
+                entries.append(dict(origin='payroll_adjustment',reference=f"{adjustment['id']}:{item['id']}",month=adjustment['month'],department_id=item['department_id'],category='personnel',description='Complemento de folha · '+item['name'],amount=item['accrual_cost']))
         for r in c.execute('SELECT * FROM dre_import_entries WHERE month>=? AND month<=?',(start,end)):
             entries.append(dict(origin='import',reference=r['reference'],month=r['month'],department_id=r['department_id'],category=r['category'],description=r['description'],amount=r['amount']))
     entries = [e for e in entries if department_id is None or e['department_id']==department_id]
@@ -93,7 +96,7 @@ def parse_csv(m, payload, who, c):
         try:
             if None in row: raise ValueError('Quantidade de colunas inválida.')
             origin=(row.get('origem') or 'import').strip()
-            if origin in ('transaction','payroll'):
+            if origin in ('transaction','payroll','payroll_adjustment'):
                 existing+=1; continue  # Internal sources in an exported file never become new postings.
             if origin!='import': raise ValueError('Origem deve ser import.')
             ym=f"{int(row['ano']):04d}-{int(row['mes']):02d}"
@@ -178,6 +181,8 @@ def register_routes(m):
             if not items: return {**summary,'imported':0}
             digest=hashlib.sha256(payload.content.encode()).hexdigest()
             batch=c.execute('INSERT INTO dre_import_batches(sha256,actor,created_at,row_count) VALUES(?,?,?,?) RETURNING id',(digest,who['user'],m.iso(m.utcnow()),len(items))).fetchone()['id']
+            from app.financial_controls import ensure_open
             for r in items:
+                ensure_open(c, r['month']+'-01')
                 c.execute('INSERT INTO dre_import_entries(batch_id,reference,month,department_id,category,description,amount) VALUES(?,?,?,?,?,?,?)',(batch,r['reference'],r['month'],r['department_id'],r['category'],r['description'],r['amount']))
             return {**summary,'imported':len(items),'batch_id':batch}

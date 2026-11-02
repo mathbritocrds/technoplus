@@ -301,7 +301,7 @@ def test_staff_automation_conflicts_and_atomic_rescheduling(service):
 def test_vacation_balance_quote_and_consumption(service):
     client, auth = service
     eid = employee(service,salary=3000,hired='2024-01-01')
-    payload = {'acquisition_start':'2024-01-01','starts_on':'2026-02-10','days':30}
+    payload = {'acquisition_start':'2024-01-01','starts_on':'2026-02-10','days':30,'consent':True}
     quote = client.post(f'/employees/{eid}/vacations/quote',json=payload,headers=auth)
     assert quote.status_code == 200 and quote.json()['gross'] == 8000 and quote.json()['payment_due'] == '2026-02-08'
     assert client.post(f'/employees/{eid}/vacations',json=payload,headers=auth).status_code == 201

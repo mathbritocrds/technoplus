@@ -159,9 +159,14 @@ def test_pin_errado_bloqueia(auth):
 def test_integridade_detecta_adulteracao(auth, ana):
     assert client.get("/time-entries/verify", headers=auth).json()["ok"] is True
     con = sqlite3.connect(main.DB)
-    con.execute("UPDATE time_entries SET at='2020-01-01T00:00:00+00:00' WHERE nsr=1"); con.commit()
-    res = client.get("/time-entries/verify", headers=auth).json()
-    assert res["ok"] is False and res["broken_nsr"] == 1
+    original_at = con.execute("SELECT at FROM time_entries WHERE nsr=1").fetchone()[0]
+    try:
+        con.execute("UPDATE time_entries SET at='2020-01-01T00:00:00+00:00' WHERE nsr=1"); con.commit()
+        res = client.get("/time-entries/verify", headers=auth).json()
+        assert res["ok"] is False and res["broken_nsr"] == 1
+    finally:
+        con.execute("UPDATE time_entries SET at=? WHERE nsr=1", (original_at,)); con.commit()
+        con.close()
 
 def test_exportacao_csv(auth, ana):
     r = client.get("/time-entries/export.csv", headers=auth)

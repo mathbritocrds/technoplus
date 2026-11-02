@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.database import connect_postgres
 from app.migrations import apply_sqlite_migrations
 from app.services import AppServices
+from app.corporate_schema import SCHEMA as CORPORATE_SCHEMA, SQLITE_GUARDS
 from app.business_schema import SCHEMA as BUSINESS_SCHEMA, MIGRATIONS as BUSINESS_MIGRATIONS
 from app import payroll as hr
 from app import business
@@ -174,6 +175,8 @@ MIGRATIONS = ["ALTER TABLE employees ADD COLUMN cpf TEXT DEFAULT ''",
 
 SCHEMA += BUSINESS_SCHEMA
 SCHEMA += ACCOUNTING_SCHEMA
+SCHEMA += CORPORATE_SCHEMA
+SCHEMA += SQLITE_GUARDS
 MIGRATIONS += BUSINESS_MIGRATIONS
 MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''"]
 
@@ -883,36 +886,30 @@ def employee_summary(who=Depends(employee_principal)):
     with db() as c:
         employee = c.execute("SELECT id,name,role,department_id FROM employees WHERE id=? AND active=1",
                              (who["employee_id"],)).fetchone()
-        entries = rows(c.execute(
-            "SELECT kind,effective_at AS at FROM effective_time_entries WHERE employee_id=? AND accepted=1 AND at>=? AND at<? "
-            "ORDER BY at,id", (who["employee_id"], start, end)))
         configured = settings(c)
+        completed = timekeeping_period(c, start, end, employee_id=who["employee_id"]).get(who["employee_id"], {})
+        live = timekeeping_period(c, start, end, now, who["employee_id"]).get(who["employee_id"], {})
+        last_entry = c.execute("SELECT effective_at FROM effective_time_entries WHERE employee_id=? AND accepted=1 ORDER BY effective_at DESC,id DESC LIMIT 1", (who["employee_id"],)).fetchone()
     if not employee:
         raise HTTPException(401, "Conta de funcionário inativa.")
-    worked_seconds = 0
-    open_entry = None
-    for entry in entries:
-        at = datetime.fromisoformat(entry["at"])
-        if entry["kind"] == "entrada":
-            open_entry = at
-        elif open_entry:
-            worked_seconds += max(0, (at - open_entry).total_seconds())
-            open_entry = None
+    worked_seconds = completed.get('total', 0) * 3600
+    total = live.get('total', 0) * 3600
+    open_entry = live.get('open')
     shift_seconds = max(0, (now - open_entry).total_seconds()) if open_entry else 0
-    total = worked_seconds + shift_seconds
     alert_minutes = int(configured.get("clock_break_alert_minutes", 240))
     daily_target = float(configured.get("daily_hours", DAILY_HOURS))
     return {
         "employee": dict(employee),
         "on_clock": open_entry is not None,
         "clocked_since": iso(open_entry) if open_entry else None,
+        "counter_started_at": iso(max(open_entry, datetime.fromisoformat(start))) if open_entry else None,
         "worked_minutes": round(total / 60),
         "completed_seconds": round(worked_seconds),
         "bank_minutes": round(total / 60) - round(daily_target * 60),
         "break_alert": bool(open_entry and shift_seconds >= alert_minutes * 60),
         "break_alert_minutes": alert_minutes,
         "clock_gps_accuracy_m": float(configured.get('clock_gps_accuracy_m', MAX_GPS_ERROR_M)),
-        "last_entry": entries[-1]["at"] if entries else None,
+        "last_entry": last_entry["effective_at"] if last_entry else None,
     }
 
 @app.post("/employee/requests", status_code=201)
@@ -963,17 +960,10 @@ def employee_timesheet(month: Optional[str] = None, who=Depends(employee_princip
         entries = rows(c.execute(
             "SELECT kind,at,nsr,hash,effective_at FROM effective_time_entries WHERE employee_id=? AND accepted=1 AND at>=? AND at<? "
             "ORDER BY at,id", (who["employee_id"], a, b)))
+        record = timesheet_data(c, ym, employee_id=who["employee_id"]).get(who["employee_id"], {})
     if not employee:
         raise HTTPException(401, "Conta de funcionário inativa.")
-    day_hours = defaultdict(float)
-    opened = None
-    for entry in entries:
-        stamp = datetime.fromisoformat(entry.get("effective_at",entry["at"]))
-        if entry["kind"] == "entrada":
-            opened = stamp
-        elif opened:
-            day_hours[local(opened).date().isoformat()] += (stamp - opened).total_seconds() / 3600
-            opened = None
+    day_hours = record.get('days', {})
     payload = {"employee": employee["name"], "month": ym, "entries": entries,
                "days": [{"date": day, "hours": round(hours, 2)}
                         for day, hours in sorted(day_hours.items())],
@@ -997,7 +987,7 @@ def employee_payroll(month: Optional[str] = None, who=Depends(employee_principal
                              (who["employee_id"],)).fetchone()
     if not employee:
         raise HTTPException(401, "Conta de funcionário inativa.")
-    data = business.payroll_data(services, ym)
+    data = business.payroll_data(services, ym, employee_id=who["employee_id"])
     item = next((e for e in data['employees'] if e['id'] == who['employee_id']), None)
     if item is None:
         raise HTTPException(404, "Sem folha para a competência.")
@@ -1283,6 +1273,9 @@ def global_operational_settings():
         "clock_max_spread_m": float(values.get("clock_max_spread_m", MAX_SPREAD_M)),
         "clock_break_alert_minutes": int(values.get("clock_break_alert_minutes", 240)),
         "daily_hours": float(values.get("daily_hours", DAILY_HOURS)),
+        "weekly_hours": float(values.get("weekly_hours", 44)),
+        "salary_hour_divisor": float(values.get("salary_hour_divisor", 220)),
+        "overtime_multiplier": float(values.get("overtime_multiplier", 1.5)),
         "budget_limit": float(values.get("budget_limit", 0)),
     }
 
@@ -1291,6 +1284,9 @@ class OperationalSettings(BaseModel):
     clock_max_spread_m: float = Field(ge=10, le=250)
     clock_break_alert_minutes: int = Field(ge=60, le=600)
     daily_hours: float = Field(gt=0, le=16)
+    weekly_hours: float = Field(default=44, gt=0, le=80)
+    salary_hour_divisor: float = Field(default=220, gt=0, le=744)
+    overtime_multiplier: float = Field(default=1.5, ge=1, le=5)
     budget_limit: float = Field(ge=0, le=1_000_000_000)
 
 @app.get("/admin/operational-settings", dependencies=[Depends(admin)])
@@ -1299,8 +1295,8 @@ def get_operational_settings():
 
 @app.put("/admin/operational-settings", dependencies=[Depends(admin)])
 def save_operational_settings(b: OperationalSettings):
-    put_settings(b.model_dump())
-    return b.model_dump()
+    put_settings(b.model_dump(exclude_unset=True))
+    return global_operational_settings()
 
 @app.get("/admin/operations")
 def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
@@ -1315,10 +1311,8 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
         employees = rows(c.execute(
             "SELECT e.id,e.salary,e.benefits,e.department_id,d.name AS department FROM employees e "
             "LEFT JOIN departments d ON d.id=e.department_id WHERE e.active=1"))
-        entries = rows(c.execute(
-            "SELECT employee_id,kind,at FROM time_entries WHERE accepted=1 "
-            "AND at>=? AND at<? ORDER BY employee_id,at",
-            month_bounds(ym)))
+        by_employee = timesheet_data(c, ym, include_open=True)
+        configured = settings(c)
         tasks = rows(c.execute(
             "SELECT department_id,status,COUNT(*) AS total FROM tasks GROUP BY department_id,status"))
         required_entries = c.execute(
@@ -1327,19 +1321,7 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
         paid_expenses = c.execute(
             "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE kind='pagar' AND paid=1 AND due>=? AND due<?",
             (month_start.isoformat(), next_month.isoformat())).fetchone()[0]
-    daily_hours = float(global_operational_settings()["daily_hours"])
-    by_employee, present_days = {}, set()
-    for entry in entries:
-        employee_id = entry["employee_id"]
-        record = by_employee.setdefault(employee_id, {"days": defaultdict(float), "open": None})
-        stamp = datetime.fromisoformat(entry.get("effective_at",entry["at"]))
-        if entry["kind"] == "entrada":
-            record["open"] = stamp
-            present_days.add((employee_id, local(stamp).date().isoformat()))
-        elif record["open"]:
-            record["days"][local(record["open"]).date().isoformat()] += (
-                stamp - record["open"]).total_seconds() / 3600
-            record["open"] = None
+    present_days = {(eid, day) for eid, record in by_employee.items() for day in record['days']}
     departments = {}
     payroll_cost = payroll(ym)['total_company_cost']
     for employee in employees:
@@ -1351,9 +1333,9 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
         })
         group["employees"] += 1
         attendance = by_employee.get(employee["id"], {"days": {}})
-        overtime = sum(max(0, hours - daily_hours) for hours in attendance["days"].values())
+        overtime = attendance.get("overtime", 0)
         group["overtime_hours"] += overtime
-        group["overtime_cost"] += overtime * (employee["salary"] / 220) * OVERTIME_RATE
+        group["overtime_cost"] += overtime * (employee["salary"] / float(configured.get("salary_hour_divisor", 220))) * float(configured.get("overtime_multiplier", OVERTIME_RATE))
         group["present_employee_days"] += sum(
             1 for eid, _ in present_days if eid == employee["id"])
     task_metrics = {}
@@ -1380,7 +1362,7 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
         group["absenteeism_pct"] = round(
             max(0, expected - group["present_employee_days"]) * 100 / expected, 1) if expected else 0
     return {"month": ym, "departments": list(departments.values()),
-            "employees_with_attendance": required_entries, "daily_hours_target": daily_hours,
+            "employees_with_attendance": required_entries, "daily_hours_target": float(configured.get("daily_hours", DAILY_HOURS)),
             "expected_workdays": expected_workdays,
             "budget_used": round(payroll_cost + paid_expenses, 2),
             "budget_limit": global_operational_settings()["budget_limit"],
@@ -1602,8 +1584,11 @@ def list_messages(employee_id: Optional[int] = None, who: dict = Depends(princip
     with db() as c:
         if who["role"] == "employee":
             employee_id = who["employee_id"]
-        elif employee_id is not None and not c.execute("SELECT 1 FROM employees WHERE id=?", (employee_id,)).fetchone():
-            raise HTTPException(404, "Funcionário não encontrado.")
+        elif employee_id is not None:
+            if who["role"] != "admin":
+                raise HTTPException(403, "Conversas privadas de RH são restritas ao administrador e ao funcionário participante.")
+            if not c.execute("SELECT 1 FROM employees WHERE id=?", (employee_id,)).fetchone():
+                raise HTTPException(404, "Funcionário não encontrado.")
         if employee_id is None:
             query = "SELECT * FROM messages WHERE scope='team' ORDER BY id"
             params = ()
@@ -1621,6 +1606,8 @@ def send_message(b: MessageIn, who: dict = Depends(principal)):
     if who["role"] == "employee":
         employee_id = who["employee_id"] if b.scope == "private" else None
     elif b.scope == "private":
+        if who["role"] != "admin":
+            raise HTTPException(403, "Conversas privadas de RH são restritas ao administrador e ao funcionário participante.")
         if employee_id is None:
             raise HTTPException(400, "Escolha o funcionário desta conversa privada.")
         with db() as c:
@@ -1639,24 +1626,23 @@ def send_message(b: MessageIn, who: dict = Depends(principal)):
     return dict(message)
 
 # ---------- Ponto: espelho de horas ----------
-def timesheet_data(c, ym):
+def timesheet_data(c, ym, include_open=False, employee_id=None):
     a, b = month_bounds(ym)
-    daily_hours = float(settings(c).get("daily_hours", DAILY_HOURS))
-    ents = rows(c.execute("SELECT employee_id,kind,effective_at AS at FROM effective_time_entries WHERE accepted=1 AND at>=? AND at<? "
-                          "ORDER BY employee_id, effective_at", (a, b)))
-    out = {}
-    for e in ents:
-        t = datetime.fromisoformat(e["at"])
-        rec = out.setdefault(e["employee_id"], {"days": defaultdict(float), "open": None})
-        if e["kind"] == "entrada":
-            rec["open"] = t
-        elif rec["open"]:
-            rec["days"][local(rec["open"]).date().isoformat()] += (t - rec["open"]).total_seconds() / 3600
-            rec["open"] = None
-    for rec in out.values():
-        rec["total"] = sum(rec["days"].values())
-        rec["overtime"] = sum(max(0, h - daily_hours) for h in rec["days"].values())
-    return out
+    return timekeeping_period(c, a, b, utcnow() if include_open else None, employee_id)
+
+
+def timekeeping_period(c, start, end, now=None, employee_id=None):
+    from app.timekeeping import summarize
+    configured = settings(c)
+    query = 'SELECT id,employee_id,kind,effective_at AS at FROM effective_time_entries WHERE accepted=1'
+    params = ()
+    if employee_id is not None:
+        query += ' AND employee_id=?'
+        params = (employee_id,)
+    entries = rows(c.execute(query, params))
+    return summarize(entries, datetime.fromisoformat(start), datetime.fromisoformat(end),
+                     local(utcnow()).tzinfo, float(configured.get('daily_hours', DAILY_HOURS)),
+                     float(configured.get('weekly_hours', 44)), now)
 
 @app.get("/timesheet", dependencies=[Depends(admin)])
 def timesheet(month: Optional[str] = None):
@@ -2379,7 +2365,7 @@ def finance_summary(month: Optional[str] = None, year: Optional[int] = None):
         period_cost = payroll_data['total_company_cost']
         payroll_total += period_cost
         if not payroll_data['available']: unavailable.append(ym)
-        generated_salary = sum(t['amount'] for t in all_tx if t['source_key'].startswith('payroll:') and t['competence']==ym)
+        generated_salary = sum(t['amount'] * (1 if t['kind']=='pagar' else -1) for t in all_tx if t['source_key'].startswith('payroll:') and t['competence']==ym)
         residual_payroll = round(max(0, period_cost-generated_salary), 2)
         flow.append({'month': ym, 'receber': rec, 'pagar': pag, 'folha': residual_payroll,
                      'payroll_available': payroll_data['available'],
@@ -2521,7 +2507,35 @@ def add_dept(d: DeptIn):
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         eid, name = department_lead(c, d)
-        department_id = c.execute("INSERT INTO departments(name,lead,lead_employee_id) VALUES(?,?,?) RETURNING id", (d.name.strip(), name, eid)).fetchone()['id']
+        sequence = c.execute("SELECT v FROM settings WHERE k='department_id_highwater'").fetchone()
+        maximum = c.execute("SELECT COALESCE(MAX(id),0) FROM departments").fetchone()[0]
+        if sequence is None:
+            # Preserve identities from older installations, including orphaned
+            # immutable journals and snapshots left by historic deletions.
+            for table in ('ledger_journals', 'audit_events', 'time_entry_adjustments',
+                          'payment_history', 'dre_import_entries', 'transactions',
+                          'employees', 'admins', 'tasks', 'space_bookings'):
+                historical = c.execute(f"SELECT COALESCE(MAX(department_id),0) FROM {table}").fetchone()[0]
+                maximum = max(maximum, historical)
+            for row in c.execute('SELECT snapshot FROM payroll_items'):
+                historical = json.loads(row['snapshot']).get('department_id')
+                if historical is not None:
+                    maximum = max(maximum, int(historical))
+            for row in c.execute('SELECT current_json,delta_json FROM payroll_adjustments'):
+                for field in ('current_json', 'delta_json'):
+                    for item in json.loads(row[field]):
+                        historical = item.get('department_id')
+                        if historical is not None:
+                            maximum = max(maximum, int(historical))
+            for row in c.execute("SELECT resource FROM audit_log WHERE resource LIKE '/departments/%'"):
+                historical = row['resource'].removeprefix('/departments/').split('/')[0]
+                if historical.isdecimal():
+                    maximum = max(maximum, int(historical))
+        department_id = max(maximum, int(sequence['v']) if sequence else 0) + 1
+        c.execute("INSERT INTO departments(id,name,lead,lead_employee_id) VALUES(?,?,?,?)",
+                  (department_id, d.name.strip(), name, eid))
+        c.execute("INSERT INTO settings(k,v) VALUES('department_id_highwater',?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(department_id),))
         if eid: c.execute('UPDATE employees SET department_id=? WHERE id=?', (department_id,eid))
     return {"id": department_id}
 
@@ -2545,11 +2559,28 @@ def edit_dept(did: int, d: DeptIn):
 @app.delete("/departments/{did}", dependencies=[Depends(admin)])
 def delete_dept(did: int):
     with db() as c:
-        if c.execute("SELECT 1 FROM dre_import_entries WHERE department_id=?",(did,)).fetchone():
-            raise HTTPException(409,"Departamento possui lançamentos contábeis importados e deve ser preservado.")
-        if c.execute("SELECT 1 FROM admins WHERE role='manager' AND department_id=?", (did,)).fetchone():
-            raise HTTPException(409, "Remova ou transfira os acessos de gestor antes de excluir o departamento.")
-        c.execute("UPDATE employees SET department_id=NULL WHERE department_id=?", (did,))
+        c.execute('BEGIN IMMEDIATE')
+        if not c.execute('SELECT 1 FROM departments WHERE id=?', (did,)).fetchone():
+            raise HTTPException(404, "Departamento não encontrado.")
+        # Foreign keys alone cannot protect append-only journals or JSON
+        # snapshots, and SET NULL would silently erase their classification.
+        for table in ('ledger_journals', 'audit_events', 'time_entry_adjustments',
+                      'payment_history', 'dre_import_entries', 'transactions',
+                      'employees', 'admins', 'tasks', 'space_bookings'):
+            if c.execute(f'SELECT 1 FROM {table} WHERE department_id=? LIMIT 1', (did,)).fetchone():
+                raise HTTPException(409, "Departamento possui vínculos ou histórico e deve ser preservado. Transfira os vínculos ativos; históricos não podem ser apagados.")
+        for row in c.execute('SELECT snapshot FROM payroll_items'):
+            if json.loads(row['snapshot']).get('department_id') == did:
+                raise HTTPException(409, "Departamento possui folha histórica e deve ser preservado.")
+        for row in c.execute('SELECT current_json,delta_json FROM payroll_adjustments'):
+            if any(item.get('department_id') == did
+                   for field in ('current_json', 'delta_json') for item in json.loads(row[field])):
+                raise HTTPException(409, "Departamento possui complemento de folha histórico e deve ser preservado.")
+        previous = c.execute("SELECT v FROM settings WHERE k='department_id_highwater'").fetchone()
+        maximum = c.execute('SELECT COALESCE(MAX(id),0) FROM departments').fetchone()[0]
+        highwater = max(did, maximum, int(previous['v']) if previous else 0)
+        c.execute("INSERT INTO settings(k,v) VALUES('department_id_highwater',?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(highwater),))
         c.execute("DELETE FROM departments WHERE id=?", (did,))
     return {"ok": True}
 
@@ -3058,17 +3089,14 @@ def record_clock(b: Clock, request: Request, background: BackgroundTasks,
             if last_accepted and 0 <= (now-datetime.fromisoformat(last_accepted['at'])).total_seconds() < 30:
                 raise HTTPException(409, "Ponto já registrado há menos de 30 segundos. Aguarde antes de registrar novamente.")
 
-        a, z = day_range(local(now).date())
-        n = c.execute("SELECT COUNT(*) FROM time_entries WHERE employee_id=? AND accepted=1 AND at>=? AND at<?",
-                      (e["id"], a, z)).fetchone()[0]
-        kind = "entrada" if n % 2 == 0 else "saida"
+        # Alternation follows the last accepted record, including previous days.
+        previous_entry = c.execute(
+            "SELECT kind,task_id FROM time_entries WHERE employee_id=? AND accepted=1 ORDER BY id DESC LIMIT 1",
+            (e["id"],)).fetchone()
+        kind = "saida" if previous_entry and previous_entry["kind"] == "entrada" else "entrada"
         task_id = b.task_id
-        previous_task = None
         if kind == "saida":
-            previous_entry = c.execute(
-                "SELECT task_id FROM time_entries WHERE employee_id=? AND accepted=1 AND at>=? AND at<? "
-                "ORDER BY id DESC LIMIT 1", (e["id"], a, z)).fetchone()
-            previous_task = previous_entry["task_id"] if previous_entry else None
+            previous_task = previous_entry["task_id"]
             if task_id not in (None, previous_task):
                 raise HTTPException(400, "Na saída, mantenha a tarefa vinculada à entrada.")
             task_id = previous_task
@@ -3088,7 +3116,7 @@ def record_clock(b: Clock, request: Request, background: BackgroundTasks,
         c.execute("INSERT INTO time_entries(employee_id,kind,at,lat,lng,distance_m,accepted,reason,cpf,nsr,prev_hash,hash,samples,spread_m,task_id,labor_rate)"
                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (e["id"], kind, at, best.lat, best.lng, round(dist, 1), int(ok), reason, e["cpf"], nsr, prev_h, h,
-                   len(b.samples), round(spread, 1), task_id, e["salary"] / 220))
+                   len(b.samples), round(spread, 1), task_id, e["salary"] / float(s.get("salary_hour_divisor", 220))))
         if ok and task_id is not None and kind == "saida":
             run_task_automations(c, task_id, background)
     if not ok: raise HTTPException(403, reason)
@@ -3165,9 +3193,8 @@ def dashboard():
     month = local(now).strftime("%Y-%m")
     with db() as c:
         a, z = day_range(today)
-        present = c.execute("""SELECT COUNT(*) FROM (SELECT employee_id FROM time_entries
-            WHERE accepted=1 AND at>=? AND at<? GROUP BY employee_id HAVING (COUNT(*) & 1)=1) AS present_employees""",
-                            (a, z)).fetchone()[0]
+        live_day = timekeeping_period(c, a, z, now)
+        present = sum(record['open'] is not None for record in live_day.values())
         tasks = {r["status"]: r["n"] for r in c.execute("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
         task_rows = rows(c.execute("SELECT id,title,assignee,due,status,severity FROM tasks ORDER BY id DESC"))
         prods = [with_costs(p) for p in rows(c.execute("SELECT * FROM products"))]
@@ -3185,7 +3212,8 @@ def dashboard():
         dre = dre_of(c)
         lots = rows(c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 8"))
         materials = rows(c.execute("SELECT id,name,stock,unit,minimum_stock FROM materials ORDER BY name"))
-        month_hours = timesheet_data(c, month)
+        month_hours = timesheet_data(c, month, include_open=True)
+        daily_target = float(settings(c).get("daily_hours", DAILY_HOURS))
         n_mat = c.execute("SELECT COUNT(*) FROM materials").fetchone()[0]
         n_dep = c.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
         n_sp = c.execute("SELECT COUNT(*) FROM spaces").fetchone()[0]
@@ -3199,12 +3227,6 @@ def dashboard():
         record = month_hours.get(employee["id"], {"days": {}, "total": 0, "overtime": 0, "open": None})
         worked = record["total"]
         overtime = record["overtime"]
-        if record["open"]:
-            elapsed = max(0, (now - record["open"]).total_seconds() / 3600)
-            worked += elapsed
-            today_key = local(record["open"]).date().isoformat()
-            completed_today = record["days"].get(today_key, 0)
-            overtime += max(0, completed_today + elapsed - DAILY_HOURS) - max(0, completed_today - DAILY_HOURS)
         hours_worked += worked
         overtime_hours += overtime
         employee_overtime[employee["id"]] = overtime
@@ -3253,7 +3275,7 @@ def dashboard():
             "attendance_series": attendance_series,
             "hours_worked": round(hours_worked, 1),
             "overtime_hours": round(overtime_hours, 1),
-            "overtime_threshold_hours": DAILY_HOURS, "current_month": month,
+            "overtime_threshold_hours": daily_target, "current_month": month,
             "alerts": alerts, "updated_at": iso(now), "recent": recent,
             "payroll": {"net": canonical_payroll["total_net"], "inss": round(ins, 2), "charges": round(charges, 2),
                         "company_cost": canonical_payroll["total_company_cost"]},
@@ -3270,6 +3292,8 @@ services = AppServices(
 )
 business.register_routes(services)
 accounting.register_routes(services)
+from app import corporate
+corporate.register_routes(services)
 
 # ---------- Front end (mesmo domínio da API) ----------
 app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")

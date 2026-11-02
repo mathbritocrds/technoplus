@@ -40,4 +40,15 @@ await assert.rejects(pg.query('SELECT * FROM ledger_journals'),/permission denie
 await pg.exec('BEGIN;SET LOCAL ROLE authenticated;');
 await assert.rejects(pg.query('SELECT * FROM effective_time_entries'),/permission denied/);await pg.exec('ROLLBACK');
 assert.equal(BigInt((await pg.query(`SELECT SUM(l.debit_cents-l.credit_cents) AS difference FROM ledger_lines l JOIN ledger_journals j ON j.id=l.journal_id WHERE j.status='posted'`)).rows[0].difference),0n);
+await pg.query("INSERT INTO accounting_periods(month,closed,closed_at,closed_by,reason) VALUES('2026-10',1,'now','admin','Review complete')");
+await assert.rejects(post('closed-period',1),/Accounting period closed/);
+const pending=await pg.query("INSERT INTO ledger_journals(booked_on,description,source_key,payload_hash,created_at,created_by) VALUES('2026-11-01','Draft for period test','period-draft','hash','now','test') RETURNING id");
+await pg.query("INSERT INTO ledger_lines(journal_id,account_code,debit_cents,credit_cents) VALUES($1,'1.1.01',100,0),($1,'3.1.01',0,100)",[pending.rows[0].id]);
+await assert.rejects(pg.query("UPDATE ledger_journals SET booked_on='2026-10-01',status='posted' WHERE id=$1",[pending.rows[0].id]),/Accounting period closed/);
+
+await scope('manager',1,async()=>{assert.equal((await pg.query('SELECT closed FROM accounting_periods')).rows[0].closed,1);});
+await pg.exec('BEGIN;SET LOCAL ROLE anon;');
+await assert.rejects(pg.query('SELECT * FROM payroll_adjustments'),/permission denied/);await pg.exec('ROLLBACK');
+await pg.query("INSERT INTO compliance_records(month,kind,reference,evidence,reason,created_at,created_by) VALUES('2026-10','esocial','protocol','signed receipt','Reviewed','now','admin')");
+await assert.rejects(pg.query("UPDATE compliance_records SET evidence='changed'"),/Append-only/);
 await pg.close();console.log('PostgreSQL: migration repeated; immutable and balanced journals; manager scope; operator, anon and authenticated denied.');

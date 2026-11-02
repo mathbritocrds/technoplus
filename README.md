@@ -92,3 +92,7 @@ Em **Financeiro → Contabilidade**, consulte DRE com os 15 níveis solicitados,
 A implementação mantém a autenticação do SIGI, aplica escopo de departamento e RLS no PostgreSQL e registra os valores anteriores e posteriores nas correções de ponto e de custos de materiais. Consulte [arquitetura, rotas, migração e validações contábeis](docs/contabilidade-cpc51-arquitetura.md).
 
 O console contábil é um módulo React incremental. `npm run build` recompila seu bundle e inclui os arquivos estáticos no pacote Python. Execute `node scripts/test-accounting-pg.mjs` para verificar as políticas e os gatilhos contábeis no PostgreSQL embarcado de testes.
+
+## Controles corporativos
+
+Consulte [complementos da folha, conciliação, encerramento contábil e revisão fiscal](docs/controles-corporativos.md) para os fluxos administrativos, parâmetros e processos externos exigidos antes do uso oficial.

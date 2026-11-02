@@ -99,6 +99,7 @@ def connection(m: AppServices, who):
 
 
 def post(m: AppServices, c, booked_on, description, department_id, source_key, lines, actor, reverses_id=None):
+    from app.financial_controls import ensure_open
     if len(lines) < 2 or any(d < 0 or cr < 0 or max(d,cr)>9223372036854775807 or bool(d) == bool(cr) for _, d, cr in lines):
         raise HTTPException(400, 'Partidas inválidas.')
     if sum(d for _, d, _ in lines) != sum(cr for _, _, cr in lines):
@@ -110,6 +111,7 @@ def post(m: AppServices, c, booked_on, description, department_id, source_key, l
         if existing['payload_hash'] != digest:
             raise HTTPException(409, 'Referência já utilizada com outro conteúdo.')
         return existing['id'], False
+    ensure_open(c, booked_on)
     codes = {r['code'] for r in c.execute('SELECT code FROM ledger_accounts')}
     if any(code not in codes for code, _, _ in lines):
         raise HTTPException(400, 'Conta contábil inexistente.')

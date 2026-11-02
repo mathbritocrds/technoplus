@@ -22,8 +22,10 @@ def validate_month(month):
     return start, date(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
 
 
-def tax_rules(month):
+def tax_rules(month, tax_table=None):
     start, _ = validate_month(month)
+    if tax_table is not None:
+        return tax_table
     if start.year != 2026:
         raise ValueError('Tabela fiscal não cadastrada para esta competência. Disponível: 2026.')
     return {'version': RULES_VERSION,
@@ -35,17 +37,17 @@ def tax_rules(month):
         'dependent_deduction': 189.59, 'simplified_deduction': 607.20}
 
 
-def inss(gross, month='2026-01'):
+def inss(gross, month='2026-01', tax_table=None):
     total, previous = ZERO, ZERO
-    for ceiling, rate in tax_rules(month)['inss']:
+    for ceiling, rate in tax_rules(month, tax_table)['inss']:
         taxable = max(ZERO, min(D(gross), D(ceiling)) - previous)
         total += taxable * D(rate)
         previous = D(ceiling)
-    return min(money(total), tax_rules(month)['inss_max'])
+    return min(money(total), tax_rules(month, tax_table)['inss_max'])
 
 
-def irrf(gross, contribution, profile, month):
-    rules = tax_rules(month)
+def irrf(gross, contribution, profile, month, tax_table=None):
+    rules = tax_rules(month, tax_table)
     legal = D(contribution) + D(profile['dependents']) * D(rules['dependent_deduction']) + D(profile['alimony']) + D(profile['other_deductions'])
     deduction = max(legal, D(rules['simplified_deduction']))
     base = max(ZERO, D(gross) - deduction)
@@ -53,7 +55,11 @@ def irrf(gross, contribution, profile, month):
         if ceiling is None or base <= D(ceiling):
             tax = max(ZERO, base * D(rate) - D(offset))
             break
-    reduction = min(tax, D('312.89')) if D(gross) <= 5000 else min(tax, max(ZERO, D('978.62') - D('.133145') * D(gross))) if D(gross) <= 7350 else ZERO
+    reduction = (min(tax, D(rules.get('irrf_reduction_full_amount', 312.89)))
+                 if D(gross) <= D(rules.get('irrf_reduction_full_limit', 5000)) else
+                 min(tax, max(ZERO, D(rules.get('irrf_reduction_taper_offset', 978.62)) -
+                     D(rules.get('irrf_reduction_taper_rate', .133145)) * D(gross)))
+                 if D(gross) <= D(rules.get('irrf_reduction_taper_limit', 7350)) else ZERO)
     return {'irrf': money(tax - reduction), 'irrf_base': money(base),
             'irrf_deduction': money(deduction), 'irrf_reduction': money(reduction),
             'irrf_method': 'legal' if legal >= D(rules['simplified_deduction']) else 'simplified'}
@@ -68,6 +74,8 @@ def entitlement(profile, as_of, records):
     hired = date.fromisoformat(profile['hired_on']) if profile['hired_on'] else None
     if not hired or hired > as_of:
         return {'vacation_cycles': [], 'vacation_proportional': 0, 'vacation_total': 0, 'vacation_months': 0}
+    if profile.get('terminated_on'):
+        as_of = min(as_of, date.fromisoformat(profile['terminated_on']))
     cycles, year = [], 0
     remuneration = D(profile.get('remuneration', 0))
     while anniversary(hired, year + 1) <= as_of:
@@ -95,20 +103,23 @@ def entitlement(profile, as_of, records):
             'vacation_total': money(D(proportional) + sum((D(c['amount']) for c in cycles), ZERO)), 'vacation_months': months}
 
 
-def calculate(employee, profile, month, overtime_hours=0, records=(), bonus_amount=0):
+def calculate(employee, profile, month, overtime_hours=0, records=(), bonus_amount=0, *,
+              salary_hour_divisor=220, overtime_multiplier=1.5, tax_table=None):
     start, end = validate_month(month)
-    tax_rules(month)
+    rules = tax_rules(month, tax_table)
+    if D(salary_hour_divisor) <= 0 or D(overtime_multiplier) < 1:
+        raise ValueError('Divisor de horas e adicional de horas extras inválidos.')
     p = {**PROFILE_DEFAULTS, **profile}
     hired = date.fromisoformat(p['hired_on']) if p['hired_on'] else start.replace(month=1)
     terminated = date.fromisoformat(p['terminated_on']) if p['terminated_on'] else end
     days = max(0, (min(end, terminated)-max(start, hired)).days+1)
     fraction = D(1) if days == (end-start).days+1 else min(D(1), D(days)/30)
     salary = D(employee['salary'])
-    ot = D(money(D(overtime_hours) * salary / 220 * D('1.5'))) if days else ZERO
+    ot = D(money(D(overtime_hours) * salary / D(salary_hour_divisor) * D(overtime_multiplier))) if days else ZERO
     bonus = D(money(bonus_amount)) if days else ZERO
     gross = D(money(salary * fraction + ot + bonus))
-    contribution = inss(gross, month)
-    taxes = irrf(gross, contribution, p, month)
+    contribution = inss(gross, month, rules)
+    taxes = irrf(gross, contribution, p, month, rules)
     vt = D(money(D(p['vt_amount']) * fraction))
     va = D(money(D(p['va_amount']) * fraction))
     vt_discount = D(money(min(vt, salary * fraction * D(p['vt_rate']))))
@@ -134,7 +145,7 @@ def calculate(employee, profile, month, overtime_hours=0, records=(), bonus_amou
         'company_cost': money(cash_cost), 'accrual_cost': money(cash_cost+thirteenth_provision+vacation_provision+provision_charges-vacation_salary_offset-vacation_charge_offset),
         'thirteenth_months': thirteenth_months, 'thirteenth_proportional': money(remuneration*D(thirteenth_months)/12),
         'thirteenth_provision': float(thirteenth_provision), 'vacation_provision': float(vacation_provision),
-        'vacation_salary_offset': float(vacation_salary_offset), 'vacation_charge_offset': float(vacation_charge_offset), 'provision_charges': float(provision_charges), 'rules_version': RULES_VERSION,
+        'vacation_salary_offset': float(vacation_salary_offset), 'vacation_charge_offset': float(vacation_charge_offset), 'provision_charges': float(provision_charges), 'rules_version': rules['version'],
         'profile_complete': bool(p['hired_on']), 'calculation_profile': {k: p[k] for k in PROFILE_DEFAULTS}}
     result.update(entitlement({**p, 'remuneration': float(remuneration)}, min(end, terminated), records))
     return result

@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import json
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Literal
 
@@ -71,6 +72,7 @@ class VacationIn(BaseModel):
     acquisition_start: str
     days: int = Field(ge=1, le=30)
     starts_on: str
+    consent: bool = False
 
 
 def month_or_error(month):
@@ -105,38 +107,98 @@ def profile_for(c, employee_id):
     return {**hr.PROFILE_DEFAULTS, **(dict(row) if row else {})}
 
 
-def payroll_data(m: AppServices, month, c=None):
+def payroll_batch(c, months, employee_id=None):
+    """Load one request's payroll inputs in bulk, independent of staff count."""
+    months = sorted(set(months))
+    for month in months:
+        month_or_error(month)
+    condition, args = (' WHERE id=?', (employee_id,)) if employee_id is not None else ('', ())
+    employees = [dict(row) for row in c.execute('SELECT * FROM employees' + condition + ' ORDER BY name', args)]
+    scoped, scoped_args = (' WHERE employee_id=?', (employee_id,)) if employee_id is not None else ('', ())
+    profiles = {row['employee_id']: {**hr.PROFILE_DEFAULTS, **dict(row)}
+                for row in c.execute('SELECT * FROM employee_payroll_profiles' + scoped, scoped_args)}
+    vacations = defaultdict(list)
+    for row in c.execute('SELECT * FROM vacation_records' + scoped, scoped_args):
+        vacations[row['employee_id']].append(dict(row))
+    bonuses = {}
+    if months:
+        where = ' WHERE month>=? AND month<=?'
+        params = (months[0], months[-1])
+        if employee_id is not None:
+            where += ' AND employee_id=?'
+            params += (employee_id,)
+        bonuses = {(row['employee_id'], row['month']): row['amount']
+                   for row in c.execute('SELECT employee_id,month,amount FROM employee_bonuses' + where, params)}
+    runs = {row['month']: dict(row) for row in c.execute('SELECT * FROM payroll_runs WHERE month<=?', (months[-1],))}
+    snapshots = defaultdict(list)
+    query = 'SELECT r.month,i.employee_id,i.snapshot FROM payroll_items i JOIN payroll_runs r ON r.id=i.run_id WHERE r.month<=?'
+    params = (months[-1],)
+    if employee_id is not None:
+        query += ' AND i.employee_id=?'
+        params += (employee_id,)
+    for row in c.execute(query + ' ORDER BY r.month,i.employee_id', params):
+        snapshots[row['month']].append(json.loads(row['snapshot']))
+    adjustments = [dict(row) for row in c.execute('SELECT id,month,current_json,delta_json FROM payroll_adjustments WHERE month<=? ORDER BY id', (months[-1],))]
+    configured = {row['k']: row['v'] for row in c.execute('SELECT k,v FROM settings')}
+    return dict(employees=employees, profiles=profiles, vacations=vacations, bonuses=bonuses,
+                runs=runs, snapshots=snapshots, settings=configured, months=months,
+                employee_id=employee_id, adjustments=adjustments)
+
+
+def payroll_data(m: AppServices, month, c=None, *, employee_id=None, live=False, batch=None):
     month_or_error(month)
     if c is None:
         with m.db() as connection:
-            return payroll_data(m, month, connection)
-    run = c.execute('SELECT * FROM payroll_runs WHERE month=?', (month,)).fetchone()
-    if run:
-        employees = [json.loads(row['snapshot']) for row in c.execute('SELECT snapshot FROM payroll_items WHERE run_id=? ORDER BY employee_id', (run['id'],))]
+            return payroll_data(m, month, connection, employee_id=employee_id, live=live, batch=batch)
+    data = batch if batch is not None else payroll_batch(c, [month], employee_id)
+    if data['employee_id'] != employee_id:
+        raise ValueError('O lote da folha deve ter o mesmo escopo de funcionário.')
+    run = data['runs'].get(month)
+    if run and not live:
+        employees = [dict(row) for row in data['snapshots'][month]]
+        for adjustment in data['adjustments']:
+            if adjustment['month'] == month:
+                employees = [item for item in json.loads(adjustment['current_json'])
+                             if employee_id is None or item['id'] == employee_id]
+        rules_version = run['rules_version']
     else:
+        from app.tax_registry import get_tax_rules
         try:
-            hr.tax_rules(month)
+            table = get_tax_rules(c, month)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
+        rules_version = table['version']
         employees = []
-        timesheet = m.timesheet_data(c, month)
-        for row in c.execute('SELECT * FROM employees ORDER BY name').fetchall():
-            employee = dict(row)
-            p = profile_for(c, employee['id'])
+        timesheet = m.timesheet_data(c, month, employee_id=employee_id)
+        for employee in data['employees']:
+            p = data['profiles'].get(employee['id'], hr.PROFILE_DEFAULTS)
             if not employee['active'] and not p['terminated_on']:
                 continue
             if p['hired_on'] and p['hired_on'] > month + '-31':
                 continue
             if p['terminated_on'] and p['terminated_on'][:7] < month:
                 continue
-            records = m.rows(c.execute('SELECT * FROM vacation_records WHERE employee_id=?', (employee['id'],)))
+            records = data['vacations'][employee['id']]
             overtime = round(timesheet.get(employee['id'], {}).get('overtime', 0), 2)
-            bonus = c.execute('SELECT amount FROM employee_bonuses WHERE employee_id=? AND month=?', (employee['id'], month)).fetchone()
-            employees.append(hr.calculate(employee, p, month, overtime, records, bonus['amount'] if bonus else 0))
+            employees.append(hr.calculate(employee, p, month, overtime, records,
+                data['bonuses'].get((employee['id'], month), 0),
+                salary_hour_divisor=float(data['settings'].get('salary_hour_divisor', 220)),
+                overtime_multiplier=float(data['settings'].get('overtime_multiplier', 1.5)),
+                tax_table=table))
+    fgts = defaultdict(lambda: hr.ZERO)
+    for ym, snapshots in data['snapshots'].items():
+        if ym <= month:
+            for snapshot in snapshots:
+                fgts[snapshot['id']] += hr.D(snapshot['fgts'])
+    for adjustment in data['adjustments']:
+        if adjustment['month'] <= month:
+            for delta in json.loads(adjustment['delta_json']):
+                fgts[delta['id']] += hr.D(delta.get('fgts', 0))
     for employee in employees:
-        fgts = c.execute('SELECT i.snapshot FROM payroll_items i JOIN payroll_runs r ON r.id=i.run_id WHERE i.employee_id=? AND r.month<=?', (employee['id'], month)).fetchall()
-        employee['fgts_accumulated'] = hr.money(sum(hr.D(json.loads(row['snapshot'])['fgts']) for row in fgts))
-    return {'month': month, 'closed': bool(run), 'rules_version': run['rules_version'] if run else hr.RULES_VERSION,
+        employee['fgts_accumulated'] = hr.money(fgts[employee['id']])
+    return {'month': month, 'closed': bool(run) and not live, 'rules_version': rules_version,
+            'adjusted': not live and any(item['month'] == month for item in data['adjustments']),
+            'run_id': run['id'] if run else None,
             'employees': employees, 'total_net': hr.money(sum(hr.D(e['net']) for e in employees)),
             'total_company_cost': hr.money(sum(hr.D(e['company_cost']) for e in employees)),
             'total_accrual_cost': hr.money(sum(hr.D(e['accrual_cost']) for e in employees))}
@@ -207,7 +269,9 @@ def _register_payroll_profile_routes(m: AppServices):
     @app.get('/payroll/rules', dependencies=[Depends(m.admin)])
     def rules(month: str = '2026-01'):
         try:
-            return hr.tax_rules(month)
+            from app.tax_registry import get_tax_rules
+            with m.db() as c:
+                return get_tax_rules(c, month)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
 
@@ -247,7 +311,9 @@ def _register_payroll_profile_routes(m: AppServices):
     def set_bonus(eid: int, month: str, bonus: BonusIn, who=Depends(m.admin_context)):
         month_or_error(month)
         try:
-            hr.tax_rules(month)
+            from app.tax_registry import get_tax_rules
+            with m.db() as tax_connection:
+                get_tax_rules(tax_connection, month)
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         with m.db() as c:
@@ -276,11 +342,16 @@ def _register_payroll_closing_routes(m: AppServices):
             if existing:
                 return {'id': existing['id'], 'already_closed': True}
             data = payroll_data(m, month, c)
+            if not data['employees']:
+                raise HTTPException(409, 'Não é possível fechar uma folha sem funcionários elegíveis.')
+            pending = m.timesheet_data(c, month)
+            if any(row.get('open') or row.get('pending_entry_ids') or row.get('anomalies') for row in pending.values()):
+                raise HTTPException(409, 'Regularize as marcações de ponto pendentes antes de fechar a folha.')
             if any(not e['profile_complete'] for e in data['employees']):
                 raise HTTPException(409, 'Informe a data de admissão de todos os funcionários antes de fechar.')
             if any(e['net'] < 0 for e in data['employees']):
                 raise HTTPException(409, 'Folha com líquido negativo. Revise as deduções antes de fechar.')
-            run_id = c.execute('INSERT INTO payroll_runs(month,closed_at,closed_by,rules_version) VALUES(?,?,?,?) RETURNING id', (month, m.iso(m.utcnow()), who['user'], hr.RULES_VERSION)).fetchone()['id']
+            run_id = c.execute('INSERT INTO payroll_runs(month,closed_at,closed_by,rules_version) VALUES(?,?,?,?) RETURNING id', (month, m.iso(m.utcnow()), who['user'], data['rules_version'])).fetchone()['id']
             due = hr.validate_month(month)[1].isoformat()
             for employee in data['employees']:
                 c.execute('INSERT INTO payroll_items(run_id,employee_id,snapshot) VALUES(?,?,?)', (run_id, employee['id'], json.dumps(employee, ensure_ascii=False)))
@@ -293,13 +364,13 @@ def _register_payroll_closing_routes(m: AppServices):
 
     @app.get('/payroll/annual-cost', dependencies=[Depends(m.admin)])
     def annual(year: int = 2026):
-        if year != 2026:
-            raise HTTPException(422, 'Tabela fiscal não cadastrada para o ano solicitado.')
         consolidated = {}
         closed_months = []
+        with m.db() as c:
+            batch = payroll_batch(c, [f'{year}-{number:02d}' for number in range(1, 13)])
         for month_number in range(1, 13):
             month = f'{year}-{month_number:02d}'
-            data = payroll_data(m, month)
+            data = payroll_data(m, month, batch=batch)
             if data['closed']:
                 closed_months.append(month)
             for e in data['employees']:
@@ -337,6 +408,9 @@ def _register_vacation_routes(m: AppServices):
             p = profile_for(c, eid)
             if not p['hired_on']:
                 raise HTTPException(409, 'Informe a admissão antes de calcular férias.')
+            last_day = starts + timedelta(days=payload.days - 1)
+            if starts < date.fromisoformat(p['hired_on']) or (p['terminated_on'] and last_day > date.fromisoformat(p['terminated_on'])) or not employee['active']:
+                raise HTTPException(409, 'Férias devem ocorrer durante um vínculo ativo, antes do desligamento.')
             records = m.rows(c.execute('SELECT * FROM vacation_records WHERE employee_id=?', (eid,)))
             balance = hr.entitlement({**p, 'remuneration': employee['salary']+p['variable_average']}, starts, records)
         cycle = next((r for r in balance['vacation_cycles'] if r['start'] == acquisition.isoformat()), None)
@@ -353,13 +427,31 @@ def _register_vacation_routes(m: AppServices):
         with m.db() as c:
             c.execute('BEGIN IMMEDIATE')
             quote = vacation_quote(eid, payload)
+            if not payload.consent:
+                raise HTTPException(409, 'Registre a concordância do funcionário com o período de férias.')
+            profile = profile_for(c, eid)
+            cycle_records = m.rows(c.execute('SELECT days FROM vacation_records WHERE employee_id=? AND acquisition_start=?', (eid, payload.acquisition_start)))
+            portions = [item['days'] for item in cycle_records] + [payload.days]
+            entitlement_days = profile['vacation_days']
+            remaining = entitlement_days - sum(portions)
+            if len(portions) > 3 or (len(portions) > 1 and any(days < 5 for days in portions)) or payload.days < min(5, entitlement_days):
+                raise HTTPException(409, 'Férias permitem até três períodos; os períodos menores devem ter ao menos cinco dias.')
+            if entitlement_days >= 14 and max(portions) < 14 and remaining < 14:
+                raise HTTPException(409, 'Reserve ao menos um período de férias com quatorze dias.')
+            configured = {row['k']: row['v'] for row in c.execute('SELECT k,v FROM settings')}
+            rest_days = json.loads(configured.get('vacation_rest_weekdays', '[6]'))
+            holidays = set(json.loads(configured.get('vacation_holidays', '[]')))
             start = date.fromisoformat(payload.starts_on)
+            if any((start + timedelta(days=offset)).weekday() in rest_days or (start + timedelta(days=offset)).isoformat() in holidays for offset in (1, 2)):
+                raise HTTPException(409, 'Férias não podem iniciar nos dois dias anteriores a feriado ou descanso semanal cadastrado.')
             end = start + timedelta(days=payload.days)
             for row in c.execute('SELECT starts_on,days FROM vacation_records WHERE employee_id=?', (eid,)).fetchall():
                 old_start = date.fromisoformat(row['starts_on'])
                 if old_start < end and old_start+timedelta(days=row['days']) > start:
                     raise HTTPException(409, 'Período de férias já registrado.')
             record_id = c.execute('INSERT INTO vacation_records(employee_id,acquisition_start,days,starts_on,created_at,created_by) VALUES(?,?,?,?,?,?) RETURNING id', (eid, payload.acquisition_start, payload.days, payload.starts_on, m.iso(m.utcnow()), who['user'])).fetchone()['id']
+            from app.accounting import event
+            event(m, c, who, 'vacation', record_id, {}, {**payload.model_dump(), 'rest_weekdays': rest_days, 'holidays': sorted(holidays)}, 'Concordância e regras de concessão de férias registradas.')
         return {'id': record_id, **quote}
 
 
