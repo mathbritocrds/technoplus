@@ -6,6 +6,7 @@ import base64, binascii, csv, hashlib, hmac, io, logging, math, os, secrets, sql
 import asyncio, json
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
@@ -180,12 +181,19 @@ SCHEMA += SQLITE_GUARDS
 MIGRATIONS += BUSINESS_MIGRATIONS
 MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''"]
 
+_demo_context = ContextVar("sigi_demo", default=False)
+
 @contextmanager
 def db():
-    if SUPABASE_DATABASE_URL:
+    if SUPABASE_DATABASE_URL and not _demo_context.get():
         con = connect_postgres(SUPABASE_DATABASE_URL)
     else:
-        con = sqlite3.connect(DB)
+        if _demo_context.get():
+            from app.demo import database_path
+            path = database_path(DB)
+        else:
+            path = DB
+        con = sqlite3.connect(path)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
     try:
@@ -236,6 +244,10 @@ def seed_operational_data():
         has_account = c.execute("SELECT 1 FROM admins LIMIT 1").fetchone()
         already_seeded = c.execute("SELECT 1 FROM settings WHERE k='operational_seed_v1'").fetchone()
         if not has_account or already_seeded:
+            return
+        # Demonstrations never overwrite or mix with an operational installation.
+        if any(c.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone()
+               for table in ('employees', 'tasks', 'transactions', 'ledger_journals')):
             return
 
         today = datetime.now(timezone(timedelta(hours=-3))).date()
@@ -467,7 +479,8 @@ def month_bounds(ym: str):
 def hash_pin(pin: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt), 120_000).hex()
 
-seed_operational_data()
+if os.getenv("SIGI_DEMO_MODE") == "1":
+    seed_operational_data()
 
 def ensure_workplace_setting():
     """Keep the workplace configuration available without creating a repeated 404 state."""
@@ -476,7 +489,8 @@ def ensure_workplace_setting():
         c.execute("INSERT INTO settings(k,v) VALUES('lng','-46.6333') ON CONFLICT(k) DO NOTHING")
         c.execute("INSERT INTO settings(k,v) VALUES('radius_m','100') ON CONFLICT(k) DO NOTHING")
 
-ensure_workplace_setting()
+if os.getenv("SIGI_DEMO_MODE") == "1":
+    ensure_workplace_setting()
 
 def haversine(a, b, c, d):
     r = math.pi / 180
@@ -493,6 +507,8 @@ class LiveClients:
     async def broadcast(self, event):
         stale = set()
         for client in tuple(self.clients):
+            if getattr(client.state, "demo", False) != _demo_context.get():
+                continue
             try:
                 await client.send_json(event)
             except WebSocketDisconnect:
@@ -535,6 +551,8 @@ DEFAULT_PERMISSIONS = {
 
 def request_permission(request):
     path, method = request.url.path, request.method
+    if path.startswith("/demo/"):
+        path = path[5:]
     if path.startswith('/accounting'):
         return 'finance','view' if method=='GET' else 'create'
     if path.startswith('/time-entries/') and path.endswith('/adjustments'):
@@ -557,6 +575,8 @@ def request_permission(request):
 
 @app.middleware("http")
 async def audit_mutations(request, call_next):
+    if _demo_context.get() and request.url.path == "/demo/notifications/test":
+        return JSONResponse({"detail":"Envios externos estão desativados na demonstração."},status_code=403)
     token = request.headers.get("authorization", "")
     actor, role = "", ""
     if token.startswith("Bearer "):
@@ -593,7 +613,7 @@ async def audit_mutations(request, call_next):
                  request.client.host if request.client else ""),
             )
         if response.status_code < 400:
-            await live_clients.broadcast({"type": "change", "resource": request.url.path})
+            await live_clients.broadcast({"type": "change", "resource": request.url.path[5:] if _demo_context.get() else request.url.path})
     return response
 
 def admin(authorization: str = Header(default=""), x_admin_token: str = Header(default="")):
@@ -697,14 +717,8 @@ def manager_or_admin(who: dict = Depends(principal)):
 def auth_status():
     with db() as c:
         setup_required = not c.execute("SELECT 1 FROM admins LIMIT 1").fetchone()
-        account = None if setup_required else c.execute(
-            'SELECT "user",username FROM admins WHERE role=\'admin\' LIMIT 1'
-        ).fetchone()
-    return {
-        "setup_required": setup_required,
-        "username": account["username"] if account and account["username"] else "",
-        "email": account["user"] if account else "",
-    }
+    # Public bootstrap status must not enumerate administrator identities.
+    return {"setup_required": setup_required}
 
 @app.post("/auth/register", status_code=201)
 def register_account(b: Registration, authorization: str = Header(default="")):
@@ -1405,6 +1419,7 @@ async def event_stream(socket: WebSocket):
             await socket.close(code=1008)
             return
         principal_for_token(token)
+        socket.state.demo = _demo_context.get()
         live_clients.clients.add(socket)
         await socket.send_json({"type": "connected"})
         while True:
@@ -2849,6 +2864,8 @@ class NotificationChannelIn(BaseModel):
     recipient: str = Field(min_length=3, max_length=254)
 
 def send_notification(channel, message):
+    if _demo_context.get():
+        return
     if channel["kind"] == "email":
         import smtplib
         from email.message import EmailMessage
@@ -3288,12 +3305,21 @@ services = AppServices(
     manager_or_admin=manager_or_admin, employee_principal=employee_principal,
     rows=rows, utcnow=lambda: utcnow(), iso=iso, local=local,
     day_range=day_range, booking_time=booking_time, timesheet_data=timesheet_data,
-    quote=quote, csv_safe=csv_safe, postgres_url=lambda: SUPABASE_DATABASE_URL,
+    quote=quote, csv_safe=csv_safe, postgres_url=lambda: "" if _demo_context.get() else SUPABASE_DATABASE_URL,
 )
 business.register_routes(services)
 accounting.register_routes(services)
 from app import corporate
 corporate.register_routes(services)
+
+# ---------- Isolated demonstration and shared frontend ----------
+from app import demo
+demo.mount(demo.DemoRuntime(
+    app=app, db=db, production_database=lambda: DB, context=_demo_context,
+    SCHEMA=SCHEMA, MIGRATIONS=MIGRATIONS, apply_sqlite_migrations=apply_sqlite_migrations,
+    hash_pin=hash_pin, local=local, utcnow=lambda: utcnow(), iso=iso, entry_hash=entry_hash,
+    services=services, APP_DIR=APP_DIR, timestamp=lambda: time.time(),
+))
 
 # ---------- Front end (mesmo domínio da API) ----------
 app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")

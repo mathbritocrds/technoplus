@@ -118,7 +118,7 @@ async function uploadPaymentFile(id, input) {
   toast('Comprovante anexado.', 'ok'); await refresh();
 }
 async function downloadPaymentFile(payment, file) {
-  const response = await fetch(`/finance/payments/${payment}/attachments/${file}`,{headers:{Authorization:'Bearer '+TOKEN}});
+  const response = await apiFetch(`/finance/payments/${payment}/attachments/${file}`,{headers:{Authorization:'Bearer '+TOKEN}});
   if (!response.ok) throw new Error('Não foi possível baixar o comprovante.');
   const link=document.createElement('a'),url=URL.createObjectURL(await response.blob());link.href=url;link.download='comprovante';link.click();URL.revokeObjectURL(url);
 }

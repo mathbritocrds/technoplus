@@ -98,3 +98,13 @@ Os testes automatizados cobrem as regressões reproduzidas; a homologação com 
 - `app/static/corporate-controls.js`: formulários administrativos na interface existente.
 
 Complementos de funcionários já incluídos conservam o departamento da competência original, mesmo após uma transferência. A DRE operacional apresenta o complemento na competência da folha; o razão registra a data contábil escolhida para o ajuste. Compare os fundamentos e o intervalo completo ao reconciliar uma correção de período anterior.
+
+## Demonstração e login
+
+O login não pré-preenche senha nem divulga identidades de administradores pela consulta pública de configuração. A carga de dados demonstrativos recebida em outra alteração do repositório só executa com `SIGI_DEMO_MODE=1`, numa instalação sem dados operacionais. Ela nunca deve ser habilitada no banco de produção. A localização padrão demonstrativa também depende desse modo; a empresa deve configurar sua sede real antes de registrar ponto.
+
+## Acesso à empresa de demonstração preenchida
+
+Na tela de login, **Explorar empresa de demonstração** abre `/demo/` e entra automaticamente numa conta administrativa fictícia, sem senha compartilhada com a empresa real. O ambiente vem com seis funcionários, salários, benefícios, dependentes, férias, bonificações, ponto encadeado, tarefas, estoque, produtos, departamentos, espaços, contas financeiras e escrituração. Quando há tabela fiscal conhecida para o mês anterior, uma folha fechada também é criada.
+
+A demonstração usa um banco SQLite separado, inclusive quando a empresa real usa PostgreSQL. Seus tokens, fila offline e eventos são separados; uma sessão de demonstração não autentica na empresa real. E-mails e WhatsApp externos são desativados. As edições são permitidas e ficam somente na demonstração compartilhada. Não cadastre informações reais ali. O cabeçalho identifica os dados fictícios e permite voltar ao acesso normal. `DEMO_DB_PATH`, quando configurado, precisa apontar para um arquivo diferente de `DB_PATH`.

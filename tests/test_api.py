@@ -106,7 +106,7 @@ def test_front_end_e_servido():
     page = client.get("/").text
     assert "SIGI" in page and 'class="boot-screen"' in page
     assert "accountShortcut" in page and 'data-t="conta"' not in page
-    assert "const formG=" in page and "Criar primeira conta da empresa" in page
+    assert 'id="signInForm"' in page and "Criar conta da empresa" in page
     assert "accountShortcut" in page and "/auth/sign-in" in page
     assert "Custeio mensal por setor" in page
     assert "Composição do DRE" in page and "Alertas operacionais" in client.get("/enhancements.js").text
