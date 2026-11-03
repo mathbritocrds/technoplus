@@ -108,3 +108,11 @@ O login não pré-preenche senha nem divulga identidades de administradores pela
 Na tela de login, **Explorar empresa de demonstração** abre `/demo/` e entra automaticamente numa conta administrativa fictícia, sem senha compartilhada com a empresa real. O ambiente vem com seis funcionários, salários, benefícios, dependentes, férias, bonificações, ponto encadeado, tarefas, estoque, produtos, departamentos, espaços, contas financeiras e escrituração. Quando há tabela fiscal conhecida para o mês anterior, uma folha fechada também é criada.
 
 A demonstração usa um banco SQLite separado, inclusive quando a empresa real usa PostgreSQL. Seus tokens, fila offline e eventos são separados; uma sessão de demonstração não autentica na empresa real. E-mails e WhatsApp externos são desativados. As edições são permitidas e ficam somente na demonstração compartilhada. Não cadastre informações reais ali. O cabeçalho identifica os dados fictícios e permite voltar ao acesso normal. `DEMO_DB_PATH`, quando configurado, precisa apontar para um arquivo diferente de `DB_PATH`.
+
+## Revisão de isolamento e configuração
+
+A identificação de produção ou demonstração vem do servidor, inclusive quando o aplicativo é publicado sob um prefixo de endereço ou acessado por uma URL codificada. O navegador utiliza esse contexto para chamadas, exportações e sessões; sem contexto válido, não consulta dados. Sessões e caches mantêm separados o ambiente e o prefixo da instalação.
+
+Tentativas de login e PIN são limitadas por ambiente, origem e identidade. E-mail e nome de usuário da mesma conta compartilham o limite. Falhas na demonstração não bloqueiam a empresa real. Desativar 2FA exige senha atual e código do autenticador; cinco tentativas incorretas provocam bloqueio temporário. Os limitadores permanecem locais ao processo, conforme a limitação de implantação já documentada.
+
+Antes de preparar o banco demonstrativo, o servidor o inspeciona em leitura. Um arquivo desconhecido, marcador inválido ou banco substituído é recusado sem alterar esquema ou registros. As tabelas fiscais geram os metadados de apresentação do INSS a partir das faixas progressivas, inclusive para registros antigos. Responsável, regime e convenção não aceitam apenas espaços; dias de descanso vazios, inválidos ou repetidos são recusados.

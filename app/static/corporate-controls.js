@@ -9,6 +9,14 @@
  const period=(value)=>field('Competência','month','month',value,'required');
  const card=(title,content)=>`<details class="card employee-details" data-corporate><summary>${title}</summary>${content}</details>`;
 
+ function parsePolicyWeekdays(value){
+  const tokens=String(value).split(',').map(token=>token.trim());
+  if(tokens.some(token=>!/^[0-6]$/.test(token)))throw new Error('Informe os dias de descanso de 0 a 6, separados por vírgula, sem campos vazios.');
+  const days=tokens.map(Number);
+  if(new Set(days).size!==days.length)throw new Error('Não repita os dias de descanso.');
+  return days;
+ }
+
  async function payrollControls(){
   const value=S.businessPayroll?.month||month();
   const [adjustments,checklist,obligations]=await Promise.all([api('/payroll/adjustments?month='+value),api('/compliance/checklist?month='+value),api('/compliance/obligations?month='+value)]);
@@ -42,7 +50,7 @@
    else if(action==='close-period'||action==='reopen-period')await api('/accounting/periods/'+(action==='close-period'?'close':'reopen'),'POST',values);
    else if(action==='bank-import')await api('/accounting/bank-entries/import','POST',{account:values.account,content:await values.statement.text()});
    else if(action==='bank-match')await api('/accounting/bank-entries/'+Number(values.entry_id)+'/match','POST',{payment_id:Number(values.payment_id),reason:values.reason});
-   else if(action==='policy')await api('/compliance/policy','PUT',{...values,vacation_rest_weekdays:values.vacation_rest_weekdays.split(',').map(value=>Number(value.trim())),vacation_holidays:values.vacation_holidays.split(',').map(value=>value.trim()).filter(Boolean)});
+   else if(action==='policy')await api('/compliance/policy','PUT',{...values,vacation_rest_weekdays:parsePolicyWeekdays(values.vacation_rest_weekdays),vacation_holidays:values.vacation_holidays.split(',').map(value=>value.trim()).filter(Boolean)});
    else if(action==='work-policy'){const previous=await api('/admin/operational-settings');await api('/admin/operational-settings','PUT',{...previous,weekly_hours:Number(values.weekly_hours),salary_hour_divisor:Number(values.salary_hour_divisor),overtime_multiplier:Number(values.overtime_multiplier)})}
    else if(action==='tax-rules')await api('/compliance/tax-rules','POST',{...values,year:Number(values.year),table:JSON.parse(values.table)});
    result.textContent='Registro concluído.';toast('Registro administrativo concluído.','ok');await refresh();

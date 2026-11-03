@@ -10,12 +10,28 @@ REDUCTION_FIELDS = ('irrf_reduction_full_limit', 'irrf_reduction_full_amount',
                     'irrf_reduction_taper_rate')
 
 
+def with_inss_offsets(table):
+    """Derive display-only deductions from the progressive contribution bands.
+
+    Historical approvals may not contain this metadata. It is not an input to
+    the progressive calculation and must never override the approved bands.
+    """
+    previous, contribution = hr.ZERO, hr.ZERO
+    offsets = []
+    for ceiling, rate in table['inss']:
+        ceiling, rate = hr.D(ceiling), hr.D(rate)
+        offsets.append(hr.money(previous * rate - contribution))
+        contribution += (ceiling - previous) * rate
+        previous = ceiling
+    return {**table, 'inss_offsets': offsets}
+
+
 def get_tax_rules(connection, month):
     start, _ = hr.validate_month(month)
     row = connection.execute('SELECT v FROM settings WHERE k=?', (f'tax_rules:{start.year}',)).fetchone()
     if row:
-        return json.loads(row['v'])['table']
-    return hr.tax_rules(month)
+        return with_inss_offsets(json.loads(row['v'])['table'])
+    return with_inss_offsets(hr.tax_rules(month))
 
 
 def validate_table(year, table):
@@ -52,11 +68,11 @@ def validate_table(year, table):
             raise ValueError('A última faixa de IRRF deve ser aberta.')
     if table['irrf_reduction_taper_limit'] < table['irrf_reduction_full_limit']:
         raise ValueError('Limites da redução do IRRF estão invertidos.')
-    return table
+    return with_inss_offsets(table)
 
 
 def approve_table(connection, year, table, source, actor, approved_at):
-    validate_table(year, table)
+    table = validate_table(year, table)
     url = urlsplit(source)
     if url.scheme != 'https' or not url.hostname or url.username or url.password:
         raise ValueError('Informe a URL HTTPS da fonte oficial, sem credenciais.')
@@ -66,7 +82,7 @@ def approve_table(connection, year, table, source, actor, approved_at):
     existing = connection.execute('SELECT v FROM settings WHERE k=?', (key,)).fetchone()
     if existing:
         previous = json.loads(existing['v'])
-        if previous['table'] != table or previous['source'] != source:
+        if with_inss_offsets(previous['table']) != table or previous['source'] != source:
             raise ValueError('Versão já registrada com outro conteúdo. Cadastre uma nova versão.')
         return previous
     encoded = json.dumps(record, ensure_ascii=False)

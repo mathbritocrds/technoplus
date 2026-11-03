@@ -182,6 +182,7 @@ MIGRATIONS += BUSINESS_MIGRATIONS
 MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''"]
 
 _demo_context = ContextVar("sigi_demo", default=False)
+_app_base_context = ContextVar("sigi_base_path", default="")
 
 @contextmanager
 def db():
@@ -550,7 +551,8 @@ DEFAULT_PERMISSIONS = {
 }
 
 def request_permission(request):
-    path, method = request.url.path, request.method
+    from app.demo import route_path
+    path, method = route_path(request.scope,_app_base_context.get()), request.method
     if path.startswith("/demo/"):
         path = path[5:]
     if path.startswith('/accounting'):
@@ -575,7 +577,9 @@ def request_permission(request):
 
 @app.middleware("http")
 async def audit_mutations(request, call_next):
-    if _demo_context.get() and request.url.path == "/demo/notifications/test":
+    from app.demo import route_path
+    path=route_path(request.scope,_app_base_context.get())
+    if _demo_context.get() and path == "/demo/notifications/test":
         return JSONResponse({"detail":"Envios externos estão desativados na demonstração."},status_code=403)
     token = request.headers.get("authorization", "")
     actor, role = "", ""
@@ -603,7 +607,8 @@ async def audit_mutations(request, call_next):
                 denied = not allowed
     response = (JSONResponse({"detail": "Sua função não tem permissão para esta ação."}, status_code=403)
                 if denied else await call_next(request))
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {
+    operation_path=path[5:] if _demo_context.get() else path
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and operation_path not in {
         "/auth/login", "/auth/employee/login", "/auth/sign-in", "/auth/register", "/auth/logout",
     }:
         with db() as c:
@@ -613,7 +618,7 @@ async def audit_mutations(request, call_next):
                  request.client.host if request.client else ""),
             )
         if response.status_code < 400:
-            await live_clients.broadcast({"type": "change", "resource": request.url.path[5:] if _demo_context.get() else request.url.path})
+            await live_clients.broadcast({"type": "change", "resource": operation_path})
     return response
 
 def admin(authorization: str = Header(default=""), x_admin_token: str = Header(default="")):
@@ -639,6 +644,31 @@ def admin_context(authorization: str = Header(default=""), x_admin_token: str = 
 
 # ---------- Conta da empresa e login ----------
 _fails: dict = {}
+from threading import Lock as CredentialLock
+from app.security_limits import limited_attempts
+_fails_lock = CredentialLock()
+AUTH_ORIGIN_MAX_TRIES = 25
+
+
+def security_realm():
+    # A database identity prevents state leaking between real/demo installations,
+    # and between separate installations hosted by the same process.
+    if _demo_context.get():
+        from app.demo import database_path
+        identity = os.path.realpath(database_path(DB))
+        kind = 'demo'
+    else:
+        identity = SUPABASE_DATABASE_URL or os.path.realpath(DB)
+        kind = 'production'
+    return kind, hashlib.sha256(identity.encode()).hexdigest()
+
+
+def credential_limits(request, account_type, identity):
+    realm = security_realm()
+    origin = request.client.host if request.client else 'unknown'
+    return [((realm, 'auth-origin', origin), AUTH_ORIGIN_MAX_TRIES),
+            ((realm, account_type, origin, identity), 5)]
+
 
 class Login(BaseModel):
     password: str
@@ -774,29 +804,26 @@ def register_account(b: Registration, authorization: str = Header(default="")):
     return {"email": email, "username": username, "token": token, "role": role}
 
 @app.post("/auth/login")
-def login(b: Login):
+def login(b: Login, request: Request):
     k, now = (b.email or b.user).strip().lower(), time.time()
-    n, t = _fails.get(k, (0, 0))
-    if n >= 5 and now - t < 300:
-        raise HTTPException(429, "Muitas tentativas. Aguarde 5 minutos.")
     with db() as c:
         a = c.execute('SELECT * FROM admins WHERE lower("user")=lower(?) OR lower(username)=lower(?) '
                       'ORDER BY CASE WHEN lower("user")=lower(?) THEN 0 ELSE 1 END LIMIT 1',
                       (k, k, k)).fetchone()
-        if not a or not hmac.compare_digest(hash_pin(b.password, a["salt"]), a["hash"]):
-            _fails[k] = ((n if now - t < 300 else 0) + 1, now)
-            raise HTTPException(401, "Usuário ou senha incorretos.")
-        if a["totp_enabled"]:
-            if not b.totp_code:
-                return {"requires_otp": True}
-            if not verify_totp(a["totp_secret"], b.totp_code):
-                _fails[k] = ((n if now - t < 300 else 0) + 1, now)
-                raise HTTPException(401, "Código autenticador inválido.")
-        _fails.pop(k, None)
-        tok = secrets.token_urlsafe(32)
-        c.execute("DELETE FROM sessions WHERE expires<?", (now,))
-        c.execute('INSERT INTO sessions(token,"user",expires,role) VALUES(?,?,?,?)',
-                  (hashlib.sha256(tok.encode()).hexdigest(), a["user"], now + SESSION_HOURS * 3600, a["role"]))
+        # E-mail and username are aliases of one principal, not extra guesses.
+        identity = a['user'].casefold() if a else k
+        with limited_attempts(_fails, _fails_lock, credential_limits(request, 'management-login', identity), time.monotonic()):
+            if not a or not hmac.compare_digest(hash_pin(b.password, a["salt"]), a["hash"]):
+                raise HTTPException(401, "Usuário ou senha incorretos.")
+            if a["totp_enabled"]:
+                if not b.totp_code:
+                    return {"requires_otp": True}
+                if not verify_totp(a["totp_secret"], b.totp_code):
+                    raise HTTPException(401, "Código autenticador inválido.")
+            tok = secrets.token_urlsafe(32)
+            c.execute("DELETE FROM sessions WHERE expires<?", (now,))
+            c.execute('INSERT INTO sessions(token,"user",expires,role) VALUES(?,?,?,?)',
+                      (hashlib.sha256(tok.encode()).hexdigest(), a["user"], now + SESSION_HOURS * 3600, a["role"]))
     return {"token": tok, "user": a["user"], "name": account_username(a["user"], a["username"]),
             "role": a["role"]}
 
@@ -840,34 +867,30 @@ def update_account(b: AccountUpdate, who=Depends(principal), authorization: str 
     return {"email": email, "username": username}
 
 @app.post("/auth/employee/login")
-def employee_login(b: Login):
+def employee_login(b: Login, request: Request):
     email, now = (b.email or b.user).strip().lower(), time.time()
-    n, t = _fails.get(email, (0, 0))
-    if n >= 5 and now - t < 300:
-        raise HTTPException(429, "Muitas tentativas. Aguarde 5 minutos.")
-    with db() as c:
-        e = c.execute("SELECT id,name,account_salt,account_hash FROM employees WHERE lower(account_email)=lower(?) AND active=1",
-                       (email,)).fetchone()
-        if not e or not e["account_hash"] or not hmac.compare_digest(hash_pin(b.password, e["account_salt"]), e["account_hash"]):
-            _fails[email] = ((n if now - t < 300 else 0) + 1, now)
-            raise HTTPException(401, "E-mail ou senha incorretos.")
-        _fails.pop(email, None)
-        token = secrets.token_urlsafe(32)
-        c.execute("DELETE FROM sessions WHERE expires<?", (now,))
-        c.execute('INSERT INTO sessions(token,"user",expires,role,subject_id) VALUES(?,?,?,\'employee\',?)',
-                  (hashlib.sha256(token.encode()).hexdigest(), email, now + SESSION_HOURS * 3600, e["id"]))
+    with limited_attempts(_fails, _fails_lock, credential_limits(request, 'employee-login', email), time.monotonic()):
+        with db() as c:
+            e = c.execute("SELECT id,name,account_salt,account_hash FROM employees WHERE lower(account_email)=lower(?) AND active=1",
+                           (email,)).fetchone()
+            if not e or not e["account_hash"] or not hmac.compare_digest(hash_pin(b.password, e["account_salt"]), e["account_hash"]):
+                raise HTTPException(401, "E-mail ou senha incorretos.")
+            token = secrets.token_urlsafe(32)
+            c.execute("DELETE FROM sessions WHERE expires<?", (now,))
+            c.execute('INSERT INTO sessions(token,"user",expires,role,subject_id) VALUES(?,?,?,\'employee\',?)',
+                      (hashlib.sha256(token.encode()).hexdigest(), email, now + SESSION_HOURS * 3600, e["id"]))
     return {"token": token, "user": email, "role": "employee", "employee_id": e["id"], "name": e["name"]}
 
 @app.post("/auth/sign-in")
-def sign_in(b: Login):
+def sign_in(b: Login, request: Request):
     identity = (b.email or b.user).strip().lower()
     # Resolve the account once; never retry a failed password against another role.
     with db() as c:
         account = c.execute('SELECT 1 FROM admins WHERE lower("user")=lower(?)', (identity,)).fetchone()
         worker = c.execute('SELECT 1 FROM employees WHERE lower(account_email)=lower(?) AND active=1', (identity,)).fetchone()
     if not account and worker:
-        return employee_login(b)
-    return login(b)
+        return employee_login(b, request)
+    return login(b, request)
 
 
 @app.get("/auth/branding")
@@ -1149,20 +1172,21 @@ def pending_totp_key(user):
 
 
 @app.post("/auth/2fa/setup")
-def setup_totp(b: Optional[TotpSetup] = None, who=Depends(principal)):
+def setup_totp(request: Request, b: Optional[TotpSetup] = None, who=Depends(principal)):
     if who["role"] not in ("admin", "manager", "operator"):
         raise HTTPException(403, "2FA disponível para contas de gestão.")
-    secret = generate_totp_secret()
-    with db() as c:
-        account = c.execute('SELECT salt,hash,totp_secret,totp_enabled FROM admins WHERE "user"=?',
-                            (who["user"],)).fetchone()
-        if account["totp_enabled"] and (not b or not hmac.compare_digest(
-                hash_pin(b.current_password, account["salt"]), account["hash"])
-                or not verify_totp(account["totp_secret"], b.code)):
-            raise HTTPException(401, "Informe a senha atual e o código autenticador atual para reconfigurar o 2FA.")
-        pending = json.dumps({"secret": secret, "expires": time.time() + 600, "attempts": 0})
-        c.execute('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',
-                  (pending_totp_key(who["user"]), pending))
+    with limited_attempts(_fails, _fails_lock, credential_limits(request, 'totp-protection', who['user']), time.monotonic()):
+        secret = generate_totp_secret()
+        with db() as c:
+            account = c.execute('SELECT salt,hash,totp_secret,totp_enabled FROM admins WHERE "user"=?',
+                                (who["user"],)).fetchone()
+            if account["totp_enabled"] and (not b or not hmac.compare_digest(
+                    hash_pin(b.current_password, account["salt"]), account["hash"])
+                    or not verify_totp(account["totp_secret"], b.code)):
+                raise HTTPException(401, "Informe a senha atual e o código autenticador atual para reconfigurar o 2FA.")
+            pending = json.dumps({"secret": secret, "expires": time.time() + 600, "attempts": 0})
+            c.execute('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v',
+                      (pending_totp_key(who["user"]), pending))
     return {"secret": secret, "otpauth_url": provisioning_uri(secret, who["user"])}
 
 @app.post("/auth/2fa/enable")
@@ -1185,14 +1209,23 @@ def enable_totp(b: TotpCode, who=Depends(principal)):
         c.execute('DELETE FROM settings WHERE k=?', (key,))
     return {"enabled": True}
 
+class TotpDisable(TotpCode):
+    current_password: str = Field(min_length=1, max_length=128)
+
+
 @app.post("/auth/2fa/disable")
-def disable_totp(b: TotpCode, who=Depends(principal)):
-    with db() as c:
-        row = c.execute('SELECT totp_secret FROM admins WHERE "user"=?', (who["user"],)).fetchone()
-        if not row or not verify_totp(row["totp_secret"], b.code):
-            raise HTTPException(400, "Código autenticador inválido.")
-        c.execute('UPDATE admins SET totp_secret=NULL,totp_enabled=0 WHERE "user"=?', (who["user"],))
-        c.execute('DELETE FROM settings WHERE k=?', (pending_totp_key(who["user"]),))
+def disable_totp(b: TotpDisable, request: Request, who=Depends(principal)):
+    if who["role"] not in ("admin", "manager", "operator"):
+        raise HTTPException(403, "2FA disponível para contas de gestão.")
+    with limited_attempts(_fails, _fails_lock, credential_limits(request, 'totp-protection', who['user']), time.monotonic()):
+        with db() as c:
+            row = c.execute('SELECT salt,hash,totp_secret FROM admins WHERE "user"=?', (who["user"],)).fetchone()
+            if not row or not hmac.compare_digest(hash_pin(b.current_password, row['salt']), row['hash']):
+                raise HTTPException(401, "A senha atual está incorreta.")
+            if not verify_totp(row["totp_secret"], b.code):
+                raise HTTPException(400, "Código autenticador inválido.")
+            c.execute('UPDATE admins SET totp_secret=NULL,totp_enabled=0 WHERE "user"=?', (who["user"],))
+            c.execute('DELETE FROM settings WHERE k=?', (pending_totp_key(who["user"]),))
     return {"enabled": False}
 
 class RoleChange(BaseModel):
@@ -2968,33 +3001,21 @@ PIN_ORIGIN_MAX_TRIES = 25
 
 
 def check_employee(c, employee_id: int, pin: str, origin: str = "local"):
-    # Limits follow the connection origin, never the employee across all devices.
-    # Do not trust caller-controlled forwarding headers here.
-    now = time.monotonic()
-    keys = ((origin, None), (origin, employee_id))
-    with _pin_attempts_lock:
-        for key in [key for key, (_, until) in _pin_attempts.items() if until <= now]:
-            del _pin_attempts[key]
-        for key, limit in zip(keys, (PIN_ORIGIN_MAX_TRIES, MAX_PIN_TRIES)):
-            if _pin_attempts.get(key, (0, 0))[0] >= limit:
-                raise HTTPException(423, "Muitas tentativas de PIN nesta origem. Aguarde 5 minutos e tente novamente.")
-        # Reserve attempts before expensive hashing so parallel failures cannot
-        # all pass the limit check. The hash itself runs outside the lock.
-        for key in keys:
-            count, until = _pin_attempts.get(key, (0, now + PIN_COOLDOWN_SECONDS))
-            _pin_attempts[key] = (count + 1, until)
-    e = c.execute("SELECT * FROM employees WHERE id=? AND active=1", (employee_id,)).fetchone()
-    if not e: raise HTTPException(404, "Funcionário não encontrado.")
-    if not hmac.compare_digest(hash_pin(pin, e["pin_salt"]), e["pin_hash"]):
-        raise HTTPException(401, "PIN incorreto.")
-    with _pin_attempts_lock:
-        _pin_attempts.pop(keys[1], None)
-        count, until = _pin_attempts.get(keys[0], (1, now + PIN_COOLDOWN_SECONDS))
-        if count > 1:
-            _pin_attempts[keys[0]] = (count - 1, until)
-        else:
-            _pin_attempts.pop(keys[0], None)
-    c.execute("UPDATE employees SET failed_pins=0 WHERE id=?", (e["id"],))
+    # The origin is the observed connection, never an untrusted forwarding header.
+    realm = security_realm()
+    limits = [((realm, 'pin-origin', origin), PIN_ORIGIN_MAX_TRIES),
+              ((realm, 'employee-pin', origin, employee_id), MAX_PIN_TRIES)]
+    with limited_attempts(_pin_attempts, _pin_attempts_lock, limits, time.monotonic(),
+                          seconds=PIN_COOLDOWN_SECONDS, status_code=423,
+                          detail="Muitas tentativas de PIN nesta origem. Aguarde 5 minutos e tente novamente."):
+        e = c.execute("SELECT * FROM employees WHERE id=? AND active=1", (employee_id,)).fetchone()
+        if not e:
+            # Unknown IDs are failed authentication attempts too: keep the
+            # reservation so enumerating IDs cannot bypass the origin limit.
+            raise HTTPException(404, "Funcionário não encontrado.")
+        if not hmac.compare_digest(hash_pin(pin, e["pin_salt"]), e["pin_hash"]):
+            raise HTTPException(401, "PIN incorreto.")
+        c.execute("UPDATE employees SET failed_pins=0 WHERE id=?", (e["id"],))
     return e
 
 class Live(BaseModel):
@@ -3315,11 +3336,11 @@ corporate.register_routes(services)
 # ---------- Isolated demonstration and shared frontend ----------
 from app import demo
 demo.mount(demo.DemoRuntime(
-    app=app, db=db, production_database=lambda: DB, context=_demo_context,
+    app=app, db=db, production_database=lambda: DB, context=_demo_context,base_path_context=_app_base_context,
     SCHEMA=SCHEMA, MIGRATIONS=MIGRATIONS, apply_sqlite_migrations=apply_sqlite_migrations,
     hash_pin=hash_pin, local=local, utcnow=lambda: utcnow(), iso=iso, entry_hash=entry_hash,
     services=services, APP_DIR=APP_DIR, timestamp=lambda: time.time(),
 ))
 
 # ---------- Front end (mesmo domínio da API) ----------
-app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="static")
+app.mount("/", demo.ScopedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True,context=_demo_context,base_path_context=_app_base_context), name="static")

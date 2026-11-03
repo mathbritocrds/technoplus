@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app import accounting, business, payroll as hr
 from app.financial_controls import ensure_open
@@ -54,6 +54,8 @@ class TaxApproval(BaseModel):
 
 
 class Policy(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     vacation_rest_weekdays: list[int] = Field(default=[6], min_length=1, max_length=7)
     vacation_holidays: list[date] = Field(default=[], max_length=200)
     external_payroll_provider: str = Field(min_length=3, max_length=200)
@@ -61,12 +63,34 @@ class Policy(BaseModel):
     reviewed_agreement: str = Field(min_length=3, max_length=200)
     reason: str = Field(min_length=10, max_length=1000)
 
+    @field_validator('vacation_rest_weekdays', mode='before')
+    @classmethod
+    def valid_rest_weekdays(cls, value):
+        if (not isinstance(value, list) or not value
+                or any(type(day) is not int or not 0 <= day <= 6 for day in value)
+                or len(set(value)) != len(value)):
+            raise ValueError('Informe dias de descanso únicos entre 0 (segunda-feira) e 6 (domingo).')
+        return value
+
 
 def reason_text(value):
     value = value.strip()
     if len(value) < 5:
         raise HTTPException(422, 'Informe uma justificativa com pelo menos cinco caracteres.')
     return value
+
+
+def policy_for_display(row):
+    """Do not present legacy invalid settings as an approved policy."""
+    if not row:
+        return {'configured': False}
+    try:
+        saved = json.loads(row['v'])
+        validated = Policy.model_validate(saved)
+    except (ValueError, TypeError):
+        return {'configured': False, 'needs_review': True,
+                'message': 'A política salva precisa de revisão. Confira responsável, regime, convenção e dias de descanso.'}
+    return {**saved, **validated.model_dump(mode='json')}
 
 
 def obligation_status(m,c,month):
@@ -329,7 +353,7 @@ def register_routes(m):
     def get_policy(who=Depends(m.admin_context)):
         with m.db() as c:
             row=c.execute("SELECT v FROM settings WHERE k='compliance_policy'").fetchone()
-            return json.loads(row['v']) if row else {'configured':False}
+            return policy_for_display(row)
 
     @app.put('/compliance/policy')
     def set_policy(payload:Policy,who=Depends(m.admin_context)):
@@ -371,6 +395,6 @@ def register_routes(m):
                 table=get_tax_rules(c,month);tax={'available':True,'version':table['version']}
             except ValueError as exc:
                 tax={'available':False,'message':str(exc)}
-        return {'month':month,'payroll_closed':bool(run),'tax_rules':tax,'policy':json.loads(policy['v']) if policy else {'configured':False},'records':records,
+        return {'month':month,'payroll_closed':bool(run),'tax_rules':tax,'policy':policy_for_display(policy),'records':records,
                 'external_processes':['rescisão','liquidação e retenções de férias/13º','eSocial','FGTS Digital','recolhimentos e conciliação'],
                 'notice':'Registros são evidências informadas pelo responsável. Não constituem transmissão governamental ou confirmação bancária automática.'}

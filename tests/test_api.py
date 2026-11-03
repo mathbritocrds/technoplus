@@ -438,7 +438,7 @@ def test_totp_exige_codigo_no_login(auth):
     login = client.post("/auth/login", json={**credentials, "totp_code": totp_code(setup["secret"])})
     assert login.status_code == 200 and login.json()["role"] == "admin"
     headers = {"Authorization": "Bearer " + login.json()["token"]}
-    assert client.post("/auth/2fa/disable", json={"code": totp_code(setup["secret"])},
+    assert client.post("/auth/2fa/disable", json={"code": totp_code(setup["secret"]), "current_password": "segredo-de-teste"},
                        headers=headers).json()["enabled"] is False
 
 

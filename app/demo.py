@@ -2,21 +2,26 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
+from html import escape
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Callable
 from contextvars import ContextVar
+from contextlib import closing
 from app.services import AppServices
 from threading import Lock
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import HTMLResponse
 
 _lock = Lock()
-_initialized = set()
+_initialized = {}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -25,6 +30,7 @@ class DemoRuntime:
     db: Callable[..., Any]
     production_database: Callable[[], str]
     context: ContextVar
+    base_path_context: ContextVar
     SCHEMA: str
     MIGRATIONS: list[str]
     apply_sqlite_migrations: Callable[..., Any]
@@ -42,33 +48,67 @@ def database_path(production_path):
     return os.path.abspath(os.getenv('DEMO_DB_PATH') or os.path.join(os.path.dirname(production_path),'demo','flux.db'))
 
 
+def _file_identity(path):
+    stat = os.stat(path)
+    return stat.st_dev, stat.st_ino
+
+
+def _inspect_database(path):
+    """Prove ownership without opening an existing file for writing."""
+    if not os.path.exists(path):
+        return False, None
+    identity = _file_identity(path)
+    try:
+        with closing(sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True)) as c:
+            objects = c.execute("SELECT name,type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+            if not objects:
+                owned = False
+            else:
+                tables = {name for name, kind in objects if kind == 'table'}
+                marker = c.execute("SELECT v FROM settings WHERE k='isolated_demo_v1'").fetchall() if 'settings' in tables else []
+                if marker != [('1',)]:
+                    raise RuntimeError('O banco escolhido para demonstração já contém dados não identificados.')
+                owned = True
+    except sqlite3.DatabaseError as error:
+        raise RuntimeError('O banco escolhido para demonstração não pôde ser identificado com segurança.') from error
+    if _file_identity(path) != identity:
+        raise RuntimeError('O banco da demonstração foi substituído durante a inspeção.')
+    return owned, identity
+
+
 def initialize(main: DemoRuntime):
-    """A marker and a single transaction make the demonstration repeatable."""
+    """Only a new empty database or an identified demo can receive schema writes."""
     path=database_path(main.production_database())
     production = os.path.abspath(main.production_database())
     same_file = os.path.exists(path) and os.path.exists(production) and os.path.samefile(path, production)
     if os.path.realpath(path) == os.path.realpath(production) or same_file:
         raise RuntimeError('O banco da demonstração deve ser separado do banco operacional.')
-    if path in _initialized and os.path.isfile(path):
-        return
-    os.makedirs(os.path.dirname(path),exist_ok=True)
     with _lock:
+        owned, identity = _inspect_database(path)
+        # The ownership marker is checked even for a cached path. A replacement
+        # file or an in-place removal of the marker must never bypass preflight.
+        if owned and _initialized.get(path) == identity:
+            return
+        os.makedirs(os.path.dirname(path),exist_ok=True)
         with main.db() as c:
+            if identity is not None and _file_identity(path) != identity:
+                raise RuntimeError('O banco da demonstração foi substituído durante a inspeção.')
+            if owned:
+                marker = c.execute("SELECT v FROM settings WHERE k='isolated_demo_v1'").fetchone()
+                if not marker or marker['v'] != '1':
+                    raise RuntimeError('O banco escolhido para demonstração já contém dados não identificados.')
+            elif c.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1").fetchone():
+                raise RuntimeError('O banco escolhido para demonstração já contém dados não identificados.')
             c.executescript(main.SCHEMA)
             c.execute('BEGIN IMMEDIATE')
             main.apply_sqlite_migrations(c,main.MIGRATIONS)
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_transaction_source ON transactions(source_key) WHERE source_key<>''")
             c.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_nsr ON time_entries(nsr) WHERE nsr IS NOT NULL')
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_admin_username ON admins(lower(username)) WHERE username<>''")
-            if c.execute("SELECT 1 FROM settings WHERE k='isolated_demo_v1'").fetchone():
-                _initialized.add(path)
-                return
-            # Never adopt an arbitrary existing database as a demonstration.
-            if c.execute('SELECT 1 FROM admins LIMIT 1').fetchone() or c.execute('SELECT 1 FROM employees LIMIT 1').fetchone():
-                raise RuntimeError('O banco escolhido para demonstração já contém dados não identificados.')
-            seed(main,c)
-            c.execute("INSERT INTO settings(k,v) VALUES('isolated_demo_v1','1')")
-        _initialized.add(path)
+            if not owned:
+                seed(main,c)
+                c.execute("INSERT INTO settings(k,v) VALUES('isolated_demo_v1','1')")
+        _initialized[path] = _file_identity(path)
 
 
 def seed(main: DemoRuntime,c):
@@ -163,13 +203,52 @@ class DatabaseScope:
     def __init__(self,app,main):self.app,self.main=app,main
 
     async def __call__(self,scope,receive,send):
-        demo=scope.get('path','')=='/demo' or scope.get('path','').startswith('/demo/')
+        base_path=scope.get('root_path','').rstrip('/')
+        path=route_path(scope,base_path)
+        demo=path=='/demo' or path.startswith('/demo/')
         token=self.main.context.set(demo)
+        base_token=self.main.base_path_context.set(base_path)
         try:
             if demo and scope['type'] in ('http','websocket'):
                 await run_in_threadpool(initialize,self.main)
             await self.app(scope,receive,send)
-        finally:self.main.context.reset(token)
+        finally:
+            self.main.context.reset(token)
+            self.main.base_path_context.reset(base_token)
+
+
+def route_path(scope,base_path=None):
+    """Use the ASGI router's decoded path, relative to its deployment mount."""
+    path=scope.get('path','')
+    root=(scope.get('root_path','') if base_path is None else base_path).rstrip('/')
+    if root and (path==root or path.startswith(root+'/')):
+        return path[len(root):] or '/'
+    return path
+
+
+class ScopedStaticFiles(StaticFiles):
+    """Bind frontend API routing to the same server-side realm as the request."""
+    def __init__(self,*,directory,context,base_path_context,**kwargs):
+        super().__init__(directory=directory,**kwargs)
+        self.context=context
+        self.base_path_context=base_path_context
+        self.index_path=Path(directory,'index.html')
+
+    async def get_response(self,path,scope):
+        if self.html and path in ('.','index.html'):
+            base=self.base_path_context.get()
+            config=json.dumps({'basePath':base,'demo':bool(self.context.get())},ensure_ascii=True,separators=(',',':'))
+            config=config.replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
+            try:
+                content=await run_in_threadpool(self.index_path.read_text)
+            except FileNotFoundError:
+                return await super().get_response(path,scope)
+            if base:
+                # Shared scripts, styles, icons and navigation stay under the mount.
+                content=re.sub(r'((?:src|href)=[\"\'])/(?!/)',lambda match:match[1]+escape(base,quote=True)+'/',content)
+            content=content.replace('<head>','<head><script>globalThis.SIGI_CONTEXT='+config+';</script>',1)
+            return HTMLResponse(content,headers={'Cache-Control':'no-store'})
+        return await super().get_response(path,scope)
 
 
 def mount(main: DemoRuntime):
@@ -189,6 +268,6 @@ def mount(main: DemoRuntime):
             c.execute('INSERT INTO sessions(token,"user",expires,role) VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),account['user'],now+3600,'admin'))
         return {'token':token,'role':'admin','user':'demo@sigi.invalid','name':'Demonstração'}
 
-    demo_app.mount('/',StaticFiles(directory=os.path.join(main.APP_DIR,'static'),html=True),name='demo-static')
+    demo_app.mount('/',ScopedStaticFiles(directory=os.path.join(main.APP_DIR,'static'),html=True,context=main.context,base_path_context=main.base_path_context),name='demo-static')
     main.app.mount('/demo',demo_app,name='demo')
     main.app.add_middleware(DatabaseScope,main=main)

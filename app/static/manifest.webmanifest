@@ -2,13 +2,13 @@
   "name": "SIGI Gestão",
   "short_name": "SIGI",
   "lang": "pt-BR",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#171D19",
   "theme_color": "#171D19",
   "icons": [
     {
-      "src": "/icon.svg?v=logo-transparente-20261027",
+      "src": "icon.svg?v=logo-transparente-20261027",
       "type": "image/svg+xml",
       "sizes": "any",
       "purpose": "any"
