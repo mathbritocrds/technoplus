@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.database import connect_postgres
 from app.migrations import apply_sqlite_migrations
 from app.services import AppServices
+from app import employee_identity
 from app.corporate_schema import SCHEMA as CORPORATE_SCHEMA, SQLITE_GUARDS
 from app.business_schema import SCHEMA as BUSINESS_SCHEMA, MIGRATIONS as BUSINESS_MIGRATIONS
 from app import payroll as hr
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS products(
   labor REAL DEFAULT 0, overhead REAL DEFAULT 0, price REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tasks(
   id INTEGER PRIMARY KEY, title TEXT NOT NULL, assignee TEXT DEFAULT '',
+  assignee_employee_id INTEGER REFERENCES employees(id),
   due TEXT DEFAULT '', status INTEGER DEFAULT 0,
   priority TEXT DEFAULT 'media', progress INTEGER DEFAULT 0,
   approval TEXT DEFAULT 'pendente', severity TEXT DEFAULT 'normal',
@@ -174,12 +176,19 @@ MIGRATIONS = ["ALTER TABLE employees ADD COLUMN cpf TEXT DEFAULT ''",
               "ALTER TABLE time_entries ADD COLUMN task_id INTEGER",
               "ALTER TABLE time_entries ADD COLUMN labor_rate REAL"]
 
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS employee_name_aliases(
+ employee_id INTEGER NOT NULL REFERENCES employees(id), name TEXT NOT NULL,
+ PRIMARY KEY(employee_id,name));
+"""
 SCHEMA += BUSINESS_SCHEMA
 SCHEMA += ACCOUNTING_SCHEMA
 SCHEMA += CORPORATE_SCHEMA
 SCHEMA += SQLITE_GUARDS
 MIGRATIONS += BUSINESS_MIGRATIONS
-MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''"]
+MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''",
+               "ALTER TABLE tasks ADD COLUMN assignee_employee_id INTEGER REFERENCES employees(id)",
+               "CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id)"]
 
 _demo_context = ContextVar("sigi_demo", default=False)
 _app_base_context = ContextVar("sigi_base_path", default="")
@@ -237,6 +246,10 @@ with db() as c:
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_transaction_source ON transactions(source_key) WHERE source_key<>''")
     c.execute("UPDATE transactions SET category='revenue' WHERE kind='receber' AND category='operating'")
     c.execute("INSERT INTO payment_history(transaction_id,kind,description,amount,category,competence,paid_at,actor,department_id,source_key) SELECT id,kind,description,amount,category,CASE WHEN competence='' THEN substr(due,1,7) ELSE competence END,COALESCE(paid_at,due||'T12:00:00+00:00'),'legacy-import',department_id,source_key FROM transactions WHERE paid=1 AND NOT EXISTS (SELECT 1 FROM payment_history h WHERE h.transaction_id=transactions.id) ON CONFLICT(transaction_id) DO NOTHING")
+
+with db() as c:
+    c.execute('BEGIN IMMEDIATE')
+    employee_identity.link_legacy_references(c)
 
 def seed_operational_data():
     """Populate the installation once. The records remain fully editable in the app."""
@@ -457,6 +470,7 @@ def seed_operational_data():
             )
 
         c.execute("INSERT INTO settings(k,v) VALUES('operational_seed_v1','1') ON CONFLICT(k) DO NOTHING")
+        employee_identity.link_legacy_references(c)
 
 app = FastAPI(title="SIGI Gestão API")
 
@@ -1040,8 +1054,8 @@ def employee_tasks(who=Depends(employee_principal)):
             raise HTTPException(401, "Conta de funcionário inativa.")
         return rows(c.execute(
             "SELECT id,title,due,status,progress,priority FROM tasks "
-            "WHERE lower(assignee)=lower(?) ORDER BY CASE WHEN status=2 THEN 1 ELSE 0 END,due,id",
-            (employee["name"],)))
+            "WHERE assignee_employee_id=? ORDER BY CASE WHEN status=2 THEN 1 ELSE 0 END,due,id",
+            (who["employee_id"],)))
 
 @app.get("/employee/spaces")
 def employee_spaces(start: Optional[str] = None, end: Optional[str] = None,
@@ -1567,7 +1581,7 @@ def export_employees():
                     headers={"Content-Disposition": 'attachment; filename="funcionarios.csv"'})
 
 @app.patch("/employees/{eid}", dependencies=[Depends(admin)])
-def edit_employee(eid: int, p: EmployeePatch):
+def edit_employee(eid: int, p: EmployeePatch, who=Depends(admin_context)):
     supplied = p.model_dump(exclude_unset=True)
     if any(value is None for key, value in supplied.items() if key != 'department_id'):
         raise HTTPException(422, "Somente o departamento pode ser removido com valor nulo.")
@@ -1575,6 +1589,12 @@ def edit_employee(eid: int, p: EmployeePatch):
             for key, value in supplied.items()}
     if not data: raise HTTPException(400, "Nada para atualizar.")
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        previous = c.execute('SELECT name FROM employees WHERE id=?', (eid,)).fetchone()
+        if not previous:
+            raise HTTPException(404, "Funcionário não encontrado.")
+        if 'name' in data and data['name'] != previous['name']:
+            employee_identity.rename_employee(c, eid, previous['name'], data['name'])
         if data.get('department_id') is not None and not c.execute('SELECT 1 FROM departments WHERE id=?', (data['department_id'],)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
         if 'active' in data and not data['active'] or 'department_id' in data:
@@ -1586,6 +1606,9 @@ def edit_employee(eid: int, p: EmployeePatch):
                 raise HTTPException(409, "Substitua a chefia e remova ou transfira o acesso de gestor antes de alterar este funcionário.")
         cur = c.execute(f"UPDATE employees SET {','.join(k+'=?' for k in data)} WHERE id=?", (*data.values(), eid))
         if not cur.rowcount: raise HTTPException(404, "Funcionário não encontrado.")
+        if 'name' in data and data['name'] != previous['name']:
+            accounting.event(services,c,who,'employee',eid,{'name':previous['name']},{'name':data['name']},
+                             'Atualização do nome cadastral',data.get('department_id'))
     return {"ok": True}
 
 @app.delete("/employees/{eid}", dependencies=[Depends(admin)])
@@ -1643,7 +1666,13 @@ def list_messages(employee_id: Optional[int] = None, who: dict = Depends(princip
         else:
             query = "SELECT * FROM messages WHERE scope='team' OR (scope='private' AND employee_id=?) ORDER BY id"
             params = (employee_id,)
-        return rows(c.execute(query, params))
+        messages = rows(c.execute(query, params))
+        names = {row['id']: row['name'] for row in c.execute('SELECT id,name FROM employees')}
+        for message in messages:
+            if message['sender_role'] == 'employee' and message['sender_employee_id'] in names:
+                message['recorded_sender_name'] = message['sender_name']
+                message['sender_name'] = names[message['sender_employee_id']]
+        return messages
 
 @app.post("/messages", status_code=201)
 def send_message(b: MessageIn, who: dict = Depends(principal)):
@@ -1775,6 +1804,7 @@ class TaskIn(BaseModel):
     title: str; assignee: str = ""; due: str = ""; status: int = Field(default=0, ge=0, le=2)
     priority: str = Field(default="media"); progress: int = Field(default=0, ge=0, le=100)
     approval: str = Field(default="pendente"); severity: str = Field(default="normal")
+    assignee_employee_id: Optional[int] = Field(default=None, gt=0)
     department_id: Optional[int] = None
     labor_budget_hours: float = Field(default=0, ge=0)
     cost_ceiling: float = Field(default=0, ge=0)
@@ -1784,6 +1814,7 @@ class TaskPatch(BaseModel):
     status: Optional[int] = Field(default=None, ge=0, le=2)
     priority: Optional[str] = None; progress: Optional[int] = Field(default=None, ge=0, le=100)
     approval: Optional[str] = None; severity: Optional[str] = None
+    assignee_employee_id: Optional[int] = Field(default=None, gt=0)
     department_id: Optional[int] = None
     labor_budget_hours: Optional[float] = Field(default=None, ge=0)
     cost_ceiling: Optional[float] = Field(default=None, ge=0)
@@ -1894,13 +1925,15 @@ def run_task_automations(c, task_id, background):
 def add_task(t: TaskIn, background: BackgroundTasks, who=Depends(admin_context)):
     t = norm_task(t)
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        assignee, assignee_id = employee_identity.assignment(c, t.assignee, t.assignee_employee_id, t.department_id)
         if t.department_id is not None and not c.execute("SELECT 1 FROM departments WHERE id=?",
                                                          (t.department_id,)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
         cur = c.execute("INSERT INTO tasks(title,assignee,due,status,priority,progress,approval,severity,"
-                        "department_id,labor_budget_hours,cost_ceiling) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
-                        (t.title, t.assignee, t.due, t.status, t.priority, t.progress, t.approval,
-                         t.severity, t.department_id, t.labor_budget_hours, t.cost_ceiling))
+                        "department_id,labor_budget_hours,cost_ceiling,assignee_employee_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                        (t.title, assignee, t.due, t.status, t.priority, t.progress, t.approval,
+                         t.severity, t.department_id, t.labor_budget_hours, t.cost_ceiling, assignee_id))
         task_id = cur.fetchall()[0]["id"]
         task_history(c, task_id, who["user"], "Criação", f"Tarefa criada: {t.title}.")
         if t.status in (1, 2):
@@ -2238,14 +2271,24 @@ def move_task(tid: int, status: int, background: BackgroundTasks, who=Depends(ad
 @app.patch("/tasks/{tid}", dependencies=[Depends(admin)])
 def edit_task(tid: int, p: TaskPatch, background: BackgroundTasks, who=Depends(admin_context)):
     data = {k: v for k, v in p.model_dump().items() if v is not None}
+    if 'assignee_employee_id' in p.model_fields_set and p.assignee_employee_id is None and 'assignee' not in p.model_fields_set:
+        data['assignee'] = ''
     if "priority" in data and data["priority"] not in PRI: raise HTTPException(400, "Prioridade inválida.")
     if "severity" in data and data["severity"] not in SEV: raise HTTPException(400, "Status inválido.")
     if "approval" in data and data["approval"] not in APPR: raise HTTPException(400, "Aprovação inválida.")
     if "title" in data and not data["title"].strip(): raise HTTPException(400, "O título não pode ficar vazio.")
     if not data: raise HTTPException(400, "Nada para atualizar.")
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
         old = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
         if not old: raise HTTPException(404, "Tarefa não encontrada.")
+        if 'assignee' in p.model_fields_set or 'assignee_employee_id' in p.model_fields_set:
+            linked = p.assignee_employee_id
+            if 'assignee_employee_id' not in p.model_fields_set and data.get('assignee','').strip() == old['assignee']:
+                linked = old['assignee_employee_id']
+            name, eid = employee_identity.assignment(c, data.get('assignee',''), linked,
+                                                      data.get('department_id',old['department_id']))
+            data.update(assignee=name, assignee_employee_id=eid)
         if data.get("department_id") is not None and not c.execute(
                 "SELECT 1 FROM departments WHERE id=?", (data["department_id"],)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
@@ -2318,6 +2361,7 @@ def list_tx(status: Literal['open', 'paid', 'all'] = "open", month: Optional[str
     where = 'WHERE ' + ' AND '.join(clauses) if clauses else ''
     with db() as c:
         items = rows(c.execute(f"SELECT t.*,d.name AS department FROM transactions t LEFT JOIN departments d ON d.id=t.department_id {where} ORDER BY t.due,t.id", params))
+        employee_identity.current_payroll_descriptions(c, items)
     search = q.strip().casefold()
     return [t for t in items if not search or search in (t['description'] + ' ' + (t['department'] or '')).casefold()]
 
@@ -3079,8 +3123,8 @@ def clock_tasks(employee_id: int, pin: str, request: Request):
         employee = check_employee(c, employee_id, pin, request.client.host if request.client else "unknown")
         verify_clock_ip(request.client.host if request.client else "", settings(c))
         return rows(c.execute(
-            "SELECT id,title,due FROM tasks WHERE status=1 AND (assignee='' OR lower(assignee)=lower(?)) "
-            "ORDER BY due,id", (employee["name"],)))
+            "SELECT id,title,due FROM tasks WHERE status=1 AND (assignee='' OR assignee_employee_id=?) "
+            "ORDER BY due,id", (employee_id,)))
 
 def entry_hash(prev, nsr, cpf, at, eid, kind, lat, lng):
     return hashlib.sha256(f"{prev}|{nsr}|{cpf}|{at}|{eid}|{kind}|{lat:.6f}|{lng:.6f}".encode()).hexdigest()
@@ -3139,10 +3183,10 @@ def record_clock(b: Clock, request: Request, background: BackgroundTasks,
                 raise HTTPException(400, "Na saída, mantenha a tarefa vinculada à entrada.")
             task_id = previous_task
         if task_id is not None:
-            task = c.execute("SELECT title,assignee,status FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = c.execute("SELECT title,assignee,assignee_employee_id,status FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task or (kind == "entrada" and task["status"] != 1):
                 raise HTTPException(400, "Selecione uma tarefa que esteja em andamento.")
-            if kind == "entrada" and task["assignee"] and task["assignee"].casefold() != e["name"].casefold():
+            if kind == "entrada" and task["assignee"] and task["assignee_employee_id"] != e["id"]:
                 raise HTTPException(403, "Esta tarefa está atribuída a outra pessoa.")
         at = iso(now)
         nsr = prev_h = h = None

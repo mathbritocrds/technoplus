@@ -108,6 +108,8 @@ def initialize(main: DemoRuntime):
             if not owned:
                 seed(main,c)
                 c.execute("INSERT INTO settings(k,v) VALUES('isolated_demo_v1','1')")
+            from app.employee_identity import link_legacy_references
+            link_legacy_references(c)
         _initialized[path] = _file_identity(path)
 
 

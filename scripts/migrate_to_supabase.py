@@ -14,6 +14,7 @@ TABLES = (
     "settings",
     "departments",
     "employees",
+    "employee_name_aliases",
     "sessions",
     "products",
     "tasks",

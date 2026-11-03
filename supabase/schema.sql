@@ -548,3 +548,12 @@ CREATE TRIGGER sigi_period_guard BEFORE INSERT ON ledger_journals FOR EACH ROW E
 
 DROP TRIGGER IF EXISTS sigi_period_update_guard ON ledger_journals;
 CREATE TRIGGER sigi_period_update_guard BEFORE UPDATE OF booked_on,status ON ledger_journals FOR EACH ROW EXECUTE FUNCTION sigi_check_open_period();
+
+-- Keep operational employee links stable when a name changes.
+CREATE TABLE IF NOT EXISTS employee_name_aliases(
+ employee_id BIGINT NOT NULL REFERENCES employees(id), name TEXT NOT NULL,
+ PRIMARY KEY(employee_id,name));
+ALTER TABLE employee_name_aliases ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON employee_name_aliases FROM anon,authenticated;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_employee_id BIGINT REFERENCES employees(id);
+CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id);

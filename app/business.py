@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from app.services import AppServices
+from app.employee_identity import current_payroll_descriptions
 
 from fastapi import Depends, HTTPException
 from fastapi.responses import Response
@@ -194,7 +195,11 @@ def payroll_data(m: AppServices, month, c=None, *, employee_id=None, live=False,
         if adjustment['month'] <= month:
             for delta in json.loads(adjustment['delta_json']):
                 fgts[delta['id']] += hr.D(delta.get('fgts', 0))
+    current_names = {item['id']: item['name'] for item in data['employees']}
     for employee in employees:
+        if employee['id'] in current_names and employee['name'] != current_names[employee['id']]:
+            employee['recorded_name'] = employee['name']
+            employee['name'] = current_names[employee['id']]
         employee['fgts_accumulated'] = hr.money(fgts[employee['id']])
     return {'month': month, 'closed': bool(run) and not live, 'rules_version': rules_version,
             'adjusted': not live and any(item['month'] == month for item in data['adjustments']),
@@ -473,6 +478,7 @@ def _register_payment_routes(m: AppServices):
         query += ' ORDER BY paid_at DESC,id DESC'
         with m.db() as c:
             items = m.rows(c.execute(query, params))
+            current_payroll_descriptions(c, items)
             for item in items:
                 item['attachments'] = m.rows(c.execute('SELECT id,name,mime,size,sha256,uploaded_at,uploaded_by FROM payment_attachments WHERE payment_id=? ORDER BY id', (item['id'],)))
         return items

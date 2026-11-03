@@ -43,6 +43,7 @@ def report(m, start, end, who, department_id=None, category=None):
     with m.db() as c:
         departments = m.rows(c.execute('SELECT id,name FROM departments ORDER BY name'))
         names = {d['id']:d['name'] for d in departments}
+        employee_names = {row['id']:row['name'] for row in c.execute('SELECT id,name FROM employees')}
         if department_id is not None and department_id not in names:
             raise HTTPException(404, 'Setor não encontrado.')
         tx = m.rows(c.execute("SELECT * FROM transactions WHERE (CASE WHEN competence='' THEN substr(due,1,7) ELSE competence END)>=? AND (CASE WHEN competence='' THEN substr(due,1,7) ELSE competence END)<=?", (start,end)))
@@ -53,10 +54,10 @@ def report(m, start, end, who, department_id=None, category=None):
         for run in runs:
             for item in c.execute('SELECT employee_id,snapshot FROM payroll_items WHERE run_id=?', (run['id'],)):
                 p=json.loads(item['snapshot'])
-                entries.append(dict(origin='payroll',reference=f"{run['id']}:{item['employee_id']}",month=run['month'],department_id=p['department_id'],category='personnel',description='Folha fechada · '+p['name'],amount=p['accrual_cost']))
+                entries.append(dict(origin='payroll',reference=f"{run['id']}:{item['employee_id']}",month=run['month'],department_id=p['department_id'],category='personnel',description='Folha fechada · '+employee_names.get(p['id'],p['name']),amount=p['accrual_cost']))
         for adjustment in c.execute('SELECT id,month,delta_json FROM payroll_adjustments WHERE month>=? AND month<=?', (start,end)):
             for item in json.loads(adjustment['delta_json']):
-                entries.append(dict(origin='payroll_adjustment',reference=f"{adjustment['id']}:{item['id']}",month=adjustment['month'],department_id=item['department_id'],category='personnel',description='Complemento de folha · '+item['name'],amount=item['accrual_cost']))
+                entries.append(dict(origin='payroll_adjustment',reference=f"{adjustment['id']}:{item['id']}",month=adjustment['month'],department_id=item['department_id'],category='personnel',description='Complemento de folha · '+employee_names.get(item['id'],item['name']),amount=item['accrual_cost']))
         for r in c.execute('SELECT * FROM dre_import_entries WHERE month>=? AND month<=?',(start,end)):
             entries.append(dict(origin='import',reference=r['reference'],month=r['month'],department_id=r['department_id'],category=r['category'],description=r['description'],amount=r['amount']))
     entries = [e for e in entries if department_id is None or e['department_id']==department_id]
