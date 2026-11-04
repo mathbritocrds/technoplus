@@ -1044,7 +1044,7 @@ def employee_payroll(month: Optional[str] = None, who=Depends(employee_principal
     item = next((e for e in data['employees'] if e['id'] == who['employee_id']), None)
     if item is None:
         raise HTTPException(404, "Sem folha para a competência.")
-    allowed = ('name','role','base_salary','bonus_amount','overtime_hours','overtime_pay','gross','inss','irrf','benefits','net','vt_amount','vt_discount','va_amount','va_discount','fgts','fgts_accumulated','thirteenth_proportional','vacation_total')
+    allowed = ('pay_basis','base_pay','dsr_pay','worked_hours','regular_hours','contract_hourly_rate','cost_per_worked_hour','thirteenth_months','name','role','base_salary','bonus_amount','overtime_hours','overtime_pay','gross','inss','irrf','benefits','net','vt_amount','vt_discount','va_amount','va_discount','fgts','fgts_accumulated','thirteenth_proportional','vacation_total')
     return {"month": ym, "closed": data['closed'], **{k: item.get(k, 0) for k in allowed}}
 
 @app.get("/employee/tasks")
@@ -1376,6 +1376,7 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
             "LEFT JOIN departments d ON d.id=e.department_id WHERE e.active=1"))
         by_employee = timesheet_data(c, ym, include_open=True)
         configured = settings(c)
+        profiles={row['employee_id']:dict(row) for row in c.execute('SELECT * FROM employee_payroll_profiles')}
         tasks = rows(c.execute(
             "SELECT department_id,status,COUNT(*) AS total FROM tasks GROUP BY department_id,status"))
         required_entries = c.execute(
@@ -1398,7 +1399,7 @@ def admin_operations(month: Optional[str] = None, who=Depends(admin_context)):
         attendance = by_employee.get(employee["id"], {"days": {}})
         overtime = attendance.get("overtime", 0)
         group["overtime_hours"] += overtime
-        group["overtime_cost"] += overtime * (employee["salary"] / float(configured.get("salary_hour_divisor", 220))) * float(configured.get("overtime_multiplier", OVERTIME_RATE))
+        group["overtime_cost"] += overtime * float(hr.contract_hourly_rate(employee,profiles.get(employee['id'],{}),configured.get('salary_hour_divisor',220))) * float(configured.get("overtime_multiplier", OVERTIME_RATE))
         group["present_employee_days"] += sum(
             1 for eid, _ in present_days if eid == employee["id"])
     task_metrics = {}
@@ -1847,10 +1848,11 @@ def sync_checklist_progress(c, task_id, actor, background):
             run_task_automations(c, task_id, background)
 
 def task_cost(c, task_id):
+    divisor=float(settings(c).get('salary_hour_divisor',220))
     entries = rows(c.execute(
-        "SELECT employee_id,task_id,kind,effective_at AS at,COALESCE(labor_rate,salary/220.0) AS hourly_rate FROM effective_time_entries "
-        "JOIN employees ON employees.id=effective_time_entries.employee_id "
-        "WHERE accepted=1 ORDER BY effective_time_entries.employee_id,effective_time_entries.effective_at,effective_time_entries.id"))
+        "SELECT t.employee_id,t.task_id,t.kind,t.effective_at AS at,COALESCE(t.labor_rate,CASE WHEN p.pay_basis='hourly' THEN p.hourly_rate ELSE e.salary/? END) AS hourly_rate FROM effective_time_entries t "
+        "JOIN employees e ON e.id=t.employee_id LEFT JOIN employee_payroll_profiles p ON p.employee_id=e.id "
+        "WHERE t.accepted=1 ORDER BY t.employee_id,t.effective_at,t.id",(divisor,)))
     openings, labor_hours, labor_cost = {}, 0.0, 0.0
     for entry in entries:
         key = entry["employee_id"]
@@ -3211,7 +3213,7 @@ def record_clock(b: Clock, request: Request, background: BackgroundTasks,
         c.execute("INSERT INTO time_entries(employee_id,kind,at,lat,lng,distance_m,accepted,reason,cpf,nsr,prev_hash,hash,samples,spread_m,task_id,labor_rate)"
                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (e["id"], kind, at, best.lat, best.lng, round(dist, 1), int(ok), reason, e["cpf"], nsr, prev_h, h,
-                   len(b.samples), round(spread, 1), task_id, e["salary"] / float(s.get("salary_hour_divisor", 220))))
+                   len(b.samples), round(spread, 1), task_id, float(hr.contract_hourly_rate(e,business.profile_for(c,e['id']),s.get('salary_hour_divisor',220)))))
         if ok and task_id is not None and kind == "saida":
             run_task_automations(c, task_id, background)
     if not ok: raise HTTPException(403, reason)

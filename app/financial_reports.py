@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from collections import defaultdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from fastapi import Depends, HTTPException
@@ -28,6 +29,56 @@ def scope(who, department_id=None):
             raise HTTPException(403, 'A DRE do gestor é restrita ao seu departamento.')
         return who['department_id']
     return department_id
+
+
+def inter_statement(entries,start,end):
+    """The supplied workbook's ten monthly result lines, in integer cents."""
+    months=[]
+    cursor=date.fromisoformat(start+'-01');finish=date.fromisoformat(end+'-01')
+    while cursor<=finish:
+        months.append(cursor.strftime('%Y-%m'))
+        cursor=date(cursor.year+(cursor.month==12),cursor.month%12+1,1)
+    values={month:defaultdict(int) for month in months}
+    for entry in entries:
+        values[entry['month']][entry['category']]+=int((hr.D(entry['amount'])*100).quantize(hr.D('1')))
+    definitions=[('revenue','(+) Receita operacional',5,False),('tax','(-) Impostos',8,False),
+        ('net_revenue','(=) Receita líquida',13,True),('cost','(-) Custos diretos',14,False),
+        ('gross_profit','(=) Lucro bruto',15,True),('selling_expenses','(-) Despesas de vendas',16,False),
+        ('operating_expenses','(-) Despesas operacionais (fixas)',21,False),
+        ('operating_profit','(=) Lucro operacional',33,True),
+        ('financial_result','(+/-) Receitas/despesas diversas',34,False),('net_profit','(=) Lucro/prejuízo',40,True)]
+    calculated={}
+    for month,source in values.items():
+        revenue=source['revenue'];net_revenue=revenue-source['tax'];gross=net_revenue-source['cost']
+        operating=source['operating']+source['personnel'];profit=gross-operating
+        calculated[month]={**source,'net_revenue':net_revenue,'gross_profit':gross,'selling_expenses':0,
+            'operating_expenses':operating,'operating_profit':profit,'financial_result':-source['financial'],
+            'net_profit':profit-source['financial']}
+    revenue=sum(row['revenue'] for row in calculated.values())
+    rows=[]
+    for key,label,excel_row,subtotal in definitions:
+        cells={month:calculated[month].get(key,0) for month in months};total=sum(cells.values())
+        rows.append(dict(key=key,label=label,excel_row=excel_row,subtotal=subtotal,amount=total/100,
+            months={month:value/100 for month,value in cells.items()},
+            revenue_pct=round(total/revenue*100,2) if revenue else None))
+    # Same leaf rows and aggregate bindings as the supplied workbook export.
+    rubric_definitions=[(6,'Receitas operacionais','revenue'),(7,'Venda de serviço',None),
+        (9,'Impostos e deduções','tax'),(10,'ICMS',None),(11,'ISSQN',None),(12,'Outros impostos',None),
+        (17,'Comissão',None),(18,'Embalagens',None),(19,'Frete',None),(20,'Outras despesas de vendas',None),
+        (22,'Despesas operacionais','operating'),(23,'Aluguel',None),(24,'Condomínio',None),
+        (25,'FGTS',None),(26,'INSS',None),(27,'Luz',None),(28,'Internet',None),
+        (29,'Material de escritório',None),(30,'Material de consumo',None),
+        (31,'Pessoal, encargos e provisões','personnel'),(32,'Outras despesas operacionais',None),
+        (35,'Rendimento financeiro',None),(36,'Outras receitas',None),
+        (37,'Despesas financeiras','financial'),(38,'Juros e multas',None),(39,'Outras despesas financeiras',None)]
+    rubrics=[]
+    for excel_row,label,category in rubric_definitions:
+        cells={month:values[month].get(category,0) if category else 0 for month in months};total=sum(cells.values())
+        rubrics.append(dict(key=f'rubric_{excel_row}',label=label,excel_row=excel_row,subtotal=False,
+            amount=total/100,months={month:value/100 for month,value in cells.items()},
+            revenue_pct=round(total/revenue*100,2) if revenue else None))
+    return dict(name='Inter Empresas',months=months,rows=rows,rubrics=rubrics,
+        note='Receitas e impostos agregados nas categorias disponíveis. Despesas operacionais incluem pessoal, encargos e provisões. Despesas de vendas sem classificação específica permanecem zeradas; despesas financeiras compõem o resultado diverso. Rubricas sem classificação específica permanecem zeradas; os valores conhecidos ficam nas rubricas agregadas, sem inferência por descrição.')
 
 
 def report(m, start, end, who, department_id=None, category=None):
@@ -72,13 +123,14 @@ def report(m, start, end, who, department_id=None, category=None):
     expenses = sum(v for k,v in totals.items() if k!='revenue')
     pct = lambda value,base: round(float(value/base*100),2) if base else None
     breakdown = [dict(month=ym,year=int(ym[:4]),month_number=int(ym[5:]),department_id=did,department=names.get(did,'Sem setor'),category=key,amount=hr.money(value),revenue_pct=pct(value,revenue_base),expense_pct=pct(value,expenses) if key!='revenue' else None) for (ym,did,key),value in sorted(grouped.items(),key=lambda x:(x[0][0],names.get(x[0][1],''),x[0][2]))]
+    inter_model=inter_statement(entries,start,end)
     if category: entries=[e for e in entries if e['category']==category]
     for e in entries:
         e.update(department=names.get(e['department_id'],'Sem setor'),revenue_pct=pct(hr.D(e['amount']),revenue_base),expense_pct=pct(hr.D(e['amount']),expenses) if e['category']!='revenue' else None)
     gross=totals['revenue']-totals['tax']-totals['cost']; net=totals['revenue']-expenses
     from app.accounting import statement,cents
     cpc51=statement({'revenue':cents(totals['revenue']),'deductions':-cents(totals['tax']),'cost':-cents(totals['cost']),'operating':-cents(totals['operating']+totals['personnel']),'financing':-cents(totals['financial'])})
-    return dict(start=start,end=end,cpc51=cpc51,**{k:hr.money(v) for k,v in totals.items()},gross_profit=hr.money(gross),net_profit=hr.money(net),net_margin_pct=pct(net,revenue_base),percentages={k:pct(v,revenue_base) for k,v in totals.items()},breakdown=breakdown,entries=sorted(entries,key=lambda e:(e['month'],e['department'],e['category'],e['reference'])),departments=[d for d in departments if who['role']=='admin' or d['id']==department_id],closed_payroll_months=[r['month'] for r in runs],basis='competence',note='Pessoal inclui folhas fechadas e despesas avulsas. Importações são lançamentos contábeis, sem gerar pagamentos. Percentuais usam a receita do período; sem receita, ficam indisponíveis.')
+    return dict(start=start,end=end,cpc51=cpc51,inter_model=inter_model,**{k:hr.money(v) for k,v in totals.items()},gross_profit=hr.money(gross),net_profit=hr.money(net),net_margin_pct=pct(net,revenue_base),percentages={k:pct(v,revenue_base) for k,v in totals.items()},breakdown=breakdown,entries=sorted(entries,key=lambda e:(e['month'],e['department'],e['category'],e['reference'])),departments=[d for d in departments if who['role']=='admin' or d['id']==department_id],closed_payroll_months=[r['month'] for r in runs],basis='competence',note='Pessoal inclui folhas fechadas e despesas avulsas. Importações são lançamentos contábeis, sem gerar pagamentos. Percentuais usam a receita do período; sem receita, ficam indisponíveis.')
 
 
 def parse_csv(m, payload, who, c):

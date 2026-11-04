@@ -1,0 +1,17 @@
+# Folha por horas e composição anual
+
+Em Funcionários → Benefícios e férias, escolha Mensalista ou Horista. Mensalistas mantêm o salário mensal e a proporcionalidade por admissão/desligamento. Horistas recebem pelas horas normais concluídas e aceitas no ponto, usando o valor/h configurado. Horas extras são remuneradas separadamente pelo multiplicador da empresa, sem duplicar as horas normais. Marcações abertas ou rejeitadas não geram horas pagas; pendências bloqueiam o fechamento.
+
+O DSR de horistas é separado: (remuneração das horas normais + horas extras) ÷ dias úteis do vínculo na competência × domingos e feriados. Configure cinco ou seis dias úteis por semana e os feriados aplicáveis, no formato AAAA-MM-DD separados por vírgula. Domingos coincidentes com feriados contam uma vez. Meses sem horas concluídas não estimam salário para horistas. Benefícios continuam conforme os valores e descontos configurados. O limite de VT do horista considera remuneração básica e seu DSR, excluindo horas extras.
+
+Férias e 13º de horistas usam a referência informada: valor/h × média mensal de horas + média de adicionais. Informe a média aplicável ao contrato/período; zero no campo de horas usa o divisor mensal da empresa. A média de adicionais permanece configurável para mensalistas e horistas. O aplicativo não substitui essa informação pela última jornada isolada.
+
+O 13º acumula um avo por mês de calendário com pelo menos quinze dias de vínculo no ano. Férias proporcionais contam meses de serviço e fração de pelo menos quinze dias, respeitando a admissão e o desligamento. A provisão de férias do mês corresponde à variação dos avos de serviço; por isso, um mês curto pode não gerar novo avo e o seguinte gerar dois. Sem admissão cadastrada, direitos proporcionais não são presumidos. A simulação de férias inclui terço constitucional e aplica dobra apenas aos dias gozados após o término do prazo concessivo, inclusive em férias que atravessam esse limite.
+
+Na composição anual, o seletor exibe o gráfico de custo de cada funcionário, INSS e IRRF descontados, provisões de 13º e férias, horas concluídas e custo por hora. INSS do funcionário já está no salário bruto e não é somado novamente ao custo. Encargos patronais ficam separados. O salário de férias já coberto pelos salários mensais é compensado nas provisões para evitar duplicidade.
+
+Custo/h é a soma dos custos das competências com ponto dividido pelas horas nessas competências, sem dividir uma projeção anual inteira por horas de apenas um mês. Sem horas, o resultado é indisponível, não zero ou infinito. Fechamentos antigos sem horas no snapshot são identificados e excluídos desse denominador. Valores e horas de folhas fechadas permanecem imutáveis; mudanças valem para competências abertas e para complementos pelo processo existente.
+
+Migrações SQLite são automáticas. PostgreSQL usa `supabase/schema.sql`, com os novos campos de contrato no perfil de folha. A versão do cálculo fica no snapshot, separada da versão da tabela fiscal.
+
+Validação automatizada: `tests/test_hourly_annual_dre.py` e `scripts/hourly-annual-dre.test.mjs`. O teste de navegador percorre formulários reais de mensalista/horista, gráfico anual, simulação de férias, DRE principal e exportação Excel em desenvolvimento/compilado e desktop/celular.

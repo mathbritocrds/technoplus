@@ -1,6 +1,6 @@
 """Pair accepted clock records globally before allocating local days and overtime."""
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 
 def summarize(entries, start, end, tz, daily_hours=8, weekly_hours=44, now=None):
@@ -82,7 +82,7 @@ def summarize(entries, start, end, tz, daily_hours=8, weekly_hours=44, now=None)
         if month_days or open_stamp is not None or anomalies:
             result[employee_id] = {
                 'days': month_days, 'total': sum(month_days.values()),
-                'overtime': overtime, 'open': open_stamp,
+                'overtime': overtime, 'overtime_by_day':{day:extra_by_day[date.fromisoformat(day)] for day in month_days}, 'open': open_stamp,
                 'pending_entry_ids': pending, 'anomalies': anomalies,
             }
     return result

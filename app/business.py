@@ -18,6 +18,11 @@ from app import payroll as hr
 
 
 class PayrollProfile(BaseModel):
+    pay_basis: Literal['monthly','hourly'] = 'monthly'
+    hourly_rate: float = Field(default=0, ge=0, le=1000000, allow_inf_nan=False)
+    reference_monthly_hours: float = Field(default=0, ge=0, le=744, allow_inf_nan=False)
+    weekly_workdays: Literal[5,6] = 6
+    payroll_holidays: str = Field(default='',max_length=4000)
     hired_on: str = ''
     terminated_on: str = ''
     dependents: int = Field(default=0, ge=0, le=50)
@@ -42,6 +47,13 @@ class PayrollProfile(BaseModel):
             raise ValueError('Data de contrato inválida.')
         if self.terminated_on and (not self.hired_on or self.terminated_on < self.hired_on):
             raise ValueError('Desligamento deve ser posterior à admissão.')
+        if self.pay_basis=='hourly' and self.hourly_rate<=0:
+            raise ValueError('Informe um valor de hora positivo para o horista.')
+        try:
+            for value in self.payroll_holidays.split(','):
+                if value.strip(): date.fromisoformat(value.strip())
+        except ValueError:
+            raise ValueError('Informe os feriados no formato AAAA-MM-DD, separados por vírgula.')
         if self.va_discount > self.va_amount:
             raise ValueError('Desconto VA não pode exceder a concessão.')
         return self
@@ -180,12 +192,16 @@ def payroll_data(m: AppServices, month, c=None, *, employee_id=None, live=False,
             if p['terminated_on'] and p['terminated_on'][:7] < month:
                 continue
             records = data['vacations'][employee['id']]
-            overtime = round(timesheet.get(employee['id'], {}).get('overtime', 0), 2)
+            attendance=timesheet.get(employee['id'],{})
+            eligible_days={day:hours for day,hours in attendance.get('days',{}).items()
+                if (not p['hired_on'] or day>=p['hired_on']) and (not p['terminated_on'] or day<=p['terminated_on'])}
+            worked_hours=sum(eligible_days.values())
+            overtime=sum(attendance.get('overtime_by_day',{}).get(day,0) for day in eligible_days)
             employees.append(hr.calculate(employee, p, month, overtime, records,
                 data['bonuses'].get((employee['id'], month), 0),
                 salary_hour_divisor=float(data['settings'].get('salary_hour_divisor', 220)),
                 overtime_multiplier=float(data['settings'].get('overtime_multiplier', 1.5)),
-                tax_table=table))
+                tax_table=table,worked_hours=worked_hours))
     fgts = defaultdict(lambda: hr.ZERO)
     for ym, snapshots in data['snapshots'].items():
         if ym <= month:
@@ -379,19 +395,38 @@ def _register_payroll_closing_routes(m: AppServices):
             if data['closed']:
                 closed_months.append(month)
             for e in data['employees']:
-                item = consolidated.setdefault(e['id'], {'id': e['id'], 'name': e['name'], 'actual_closed': 0, 'projected_open': 0, 'fgts': 0, 'benefits': 0, 'provisions': 0, 'employer_charges': 0, 'salary': 0, 'net_closed': 0, 'net_projected': 0, 'bonuses': 0})
+                item = consolidated.setdefault(e['id'], {'id': e['id'], 'name': e['name'], 'actual_closed': 0, 'projected_open': 0, 'fgts': 0, 'benefits': 0, 'provisions': 0, 'employer_charges': 0, 'salary': 0, 'net_closed': 0, 'net_projected': 0, 'bonuses': 0, 'inss':0, 'irrf':0, 'thirteenth':0, 'vacation':0, 'vacation_third':0, 'vacation_salary_offset':0, 'worked_hours':0, 'overtime_hours':0, 'cost_with_recorded_hours':0, 'months_with_recorded_hours':0, 'months_without_recorded_hours':0})
                 key = 'actual_closed' if data['closed'] else 'projected_open'
                 item[key] += e['accrual_cost']
                 item['net_closed' if data['closed'] else 'net_projected'] += e['net']
                 item['bonuses'] += e.get('bonus_amount', 0)
+                hours=e.get('worked_hours')
+                if hours is None:
+                    # Older closed snapshots did not retain hours; do not read
+                    # today's clock over an immutable closed payroll.
+                    item['months_without_recorded_hours']+=1
+                else:
+                    item['worked_hours']+=hours
+                    item['overtime_hours']+=e.get('overtime_hours',0)
+                    if hours>0:
+                        item['cost_with_recorded_hours']+=e['accrual_cost']
+                        item['months_with_recorded_hours']+=1
+                for key,value in [('inss',e['inss']),('irrf',e['irrf']),
+                        ('thirteenth',e['thirteenth_provision']),('vacation',e['vacation_provision']),
+                        ('vacation_third',e.get('vacation_third_provision',e['vacation_provision']/4)),
+                        ('vacation_salary_offset',e['vacation_salary_offset'])]:
+                    item[key]+=value
                 for k, value in [('fgts', e['fgts']), ('benefits', e['benefits']+e['vt_amount']-e['vt_discount']+e['va_amount']-e['va_discount']), ('provisions', e['thirteenth_provision']+e['vacation_provision']+e['provision_charges']-e['vacation_salary_offset']-e['vacation_charge_offset']), ('employer_charges', e['employer_charges']), ('salary', e['gross'])]:
                     item[k] += value
         for item in consolidated.values():
             item['total'] = item['actual_closed']+item['projected_open']
             item['net_total'] = item['net_closed']+item['net_projected']
             for k in list(item):
-                if k not in ('id', 'name'):
+                if k not in ('id','name','worked_hours','overtime_hours','months_with_recorded_hours','months_without_recorded_hours'):
                     item[k] = hr.money(item[k])
+            item['worked_hours']=round(item['worked_hours'],4)
+            item['overtime_hours']=round(item['overtime_hours'],4)
+            item['cost_per_worked_hour']=hr.money(hr.D(item['cost_with_recorded_hours'])/hr.D(item['worked_hours'])) if item['worked_hours']>0 else None
         return {'year': year, 'closed_months': closed_months, 'employees': list(consolidated.values()), 'total_cost': hr.money(sum(hr.D(e['total']) for e in consolidated.values())), 'total_net': hr.money(sum(hr.D(e['net_total']) for e in consolidated.values())), 'basis': 'Folhas fechadas + projeção das abertas; férias provisionadas separadamente do salário.'}
 
 
@@ -417,14 +452,23 @@ def _register_vacation_routes(m: AppServices):
             if starts < date.fromisoformat(p['hired_on']) or (p['terminated_on'] and last_day > date.fromisoformat(p['terminated_on'])) or not employee['active']:
                 raise HTTPException(409, 'Férias devem ocorrer durante um vínculo ativo, antes do desligamento.')
             records = m.rows(c.execute('SELECT * FROM vacation_records WHERE employee_id=?', (eid,)))
-            balance = hr.entitlement({**p, 'remuneration': employee['salary']+p['variable_average']}, starts, records)
+            divisor=float({row['k']:row['v'] for row in c.execute('SELECT k,v FROM settings')}.get('salary_hour_divisor',220))
+            remuneration=hr.remuneration_reference(employee,p,divisor)
+            balance = hr.entitlement({**p, 'remuneration': remuneration}, starts, records)
         cycle = next((r for r in balance['vacation_cycles'] if r['start'] == acquisition.isoformat()), None)
         if not cycle or payload.days > cycle['remaining_days']:
             raise HTTPException(409, 'Período aquisitivo inválido ou saldo de férias insuficiente.')
-        base = hr.D(employee['salary']+p['variable_average']) * payload.days / 30
-        multiplier = 2 if cycle['overdue'] else 1
-        gross = hr.money(base * hr.D(4)/3 * multiplier)
-        return {'base': hr.money(base*multiplier), 'constitutional_third': hr.money(base/3*multiplier), 'gross': gross, 'overdue': cycle['overdue'], 'payment_due': (starts-timedelta(days=2)).isoformat(), 'remaining_days': cycle['remaining_days'], 'note': 'Remuneração bruta de férias. Retenções devem ser apuradas separadamente na data do pagamento.'}
+        base = remuneration * payload.days / 30
+        deadline=date.fromisoformat(cycle['concession_deadline'])
+        overdue_days=max(0,(last_day-max(starts,deadline+timedelta(days=1))).days+1)
+        overdue_base=remuneration*overdue_days/30
+        gross=hr.money((base+overdue_base)*hr.D(4)/3)
+        return {'base':hr.money(base+overdue_base),'constitutional_third':hr.money((base+overdue_base)/3),
+            'gross':gross,'overdue':bool(overdue_days),'overdue_days':overdue_days,
+            'regular_days':payload.days-overdue_days,'concession_deadline':deadline.isoformat(),
+            'double_extra':hr.money(overdue_base*hr.D(4)/3),
+            'payment_due':(starts-timedelta(days=2)).isoformat(),'remaining_days':cycle['remaining_days'],
+            'note':'Remuneração bruta de férias. Retenções devem ser apuradas separadamente na data do pagamento.'}
 
 
     @app.post('/employees/{eid}/vacations', dependencies=[Depends(m.admin)], status_code=201)

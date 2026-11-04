@@ -7,7 +7,10 @@ CREATE TABLE IF NOT EXISTS employee_payroll_profiles(
  vt_amount REAL NOT NULL DEFAULT 0, vt_rate REAL NOT NULL DEFAULT 0.06,
  va_amount REAL NOT NULL DEFAULT 0, va_discount REAL NOT NULL DEFAULT 0,
  fgts_rate REAL NOT NULL DEFAULT 0.08, employer_rate REAL NOT NULL DEFAULT 0.20,
- vacation_days INTEGER NOT NULL DEFAULT 30, variable_average REAL NOT NULL DEFAULT 0);
+ vacation_days INTEGER NOT NULL DEFAULT 30, variable_average REAL NOT NULL DEFAULT 0,
+ pay_basis TEXT NOT NULL DEFAULT 'monthly', hourly_rate REAL NOT NULL DEFAULT 0,
+ reference_monthly_hours REAL NOT NULL DEFAULT 0, weekly_workdays INTEGER NOT NULL DEFAULT 6,
+ payroll_holidays TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS employee_bonuses(
  employee_id INTEGER NOT NULL REFERENCES employees(id), month TEXT NOT NULL,
  amount REAL NOT NULL DEFAULT 0 CHECK(amount>=0), note TEXT NOT NULL DEFAULT '',
@@ -54,6 +57,11 @@ CREATE INDEX IF NOT EXISTS ix_event_staff_time ON event_staff_assignments(employ
 CREATE INDEX IF NOT EXISTS ix_payment_history_time ON payment_history(paid_at);
 """
 MIGRATIONS = [
+ "ALTER TABLE employee_payroll_profiles ADD COLUMN pay_basis TEXT NOT NULL DEFAULT 'monthly'",
+ "ALTER TABLE employee_payroll_profiles ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0",
+ "ALTER TABLE employee_payroll_profiles ADD COLUMN reference_monthly_hours REAL NOT NULL DEFAULT 0",
+ "ALTER TABLE employee_payroll_profiles ADD COLUMN weekly_workdays INTEGER NOT NULL DEFAULT 6",
+ "ALTER TABLE employee_payroll_profiles ADD COLUMN payroll_holidays TEXT NOT NULL DEFAULT ''",
  "ALTER TABLE departments ADD COLUMN lead_employee_id INTEGER REFERENCES employees(id)",
  "ALTER TABLE admins ADD COLUMN employee_id INTEGER REFERENCES employees(id)",
  "ALTER TABLE transactions ADD COLUMN category TEXT NOT NULL DEFAULT 'operating'",

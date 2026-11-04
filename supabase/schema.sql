@@ -560,3 +560,10 @@ CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id);
 
 -- Preserve explicit external task owners across legacy identity recovery.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_external INTEGER NOT NULL DEFAULT 0;
+
+-- Hourly contracts keep accepted clock hours separate from monthly salaries.
+ALTER TABLE employee_payroll_profiles ADD COLUMN IF NOT EXISTS pay_basis TEXT NOT NULL DEFAULT 'monthly';
+ALTER TABLE employee_payroll_profiles ADD COLUMN IF NOT EXISTS hourly_rate REAL NOT NULL DEFAULT 0;
+ALTER TABLE employee_payroll_profiles ADD COLUMN IF NOT EXISTS reference_monthly_hours REAL NOT NULL DEFAULT 0;
+ALTER TABLE employee_payroll_profiles ADD COLUMN IF NOT EXISTS weekly_workdays INTEGER NOT NULL DEFAULT 6;
+ALTER TABLE employee_payroll_profiles ADD COLUMN IF NOT EXISTS payroll_holidays TEXT NOT NULL DEFAULT '';
