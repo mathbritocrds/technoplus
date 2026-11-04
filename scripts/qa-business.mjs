@@ -148,7 +148,7 @@ try {
         await page.getByRole('button',{name:'Editar reserva',exact:true}).last().click();await page.locator('#eventTitle').fill('Evento editado '+viewport);await page.getByRole('button',{name:'Salvar e atualizar escala',exact:true}).click();await page.locator('#taskOverlay').waitFor({state:'hidden'});
         await page.screenshot({path:`${output}/sigi-${name}-espacos-${viewport}.png`,fullPage:true});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Horizontal overflow on spaces');
         await navigate('security','seguranca');await page.getByRole('combobox',{name:'Funcionário cadastrado',exact:true}).waitFor();
-        await navigate('rh','departamentos');await page.getByRole('combobox',{name:'Chefe cadastrado',exact:true}).first().waitFor();
+        await navigate('rh','departamentos');await page.locator('.management-edit summary').first().click();await page.getByRole('combobox',{name:'Chefe cadastrado',exact:true}).first().waitFor();
         assert.deepEqual(errors,[]);
         verdict.push({build:name,viewport,ok:true,flows:['react-accounting','double-entry','reversal','balance-sheet','trial-pagination','payroll-charts-reconciled','gps-120m','finance-periods','finance-delete-selection','filtered-finance-export','task-gauge','unified-login','username-session','mobile-menu','visual-employees','monthly-annual-totals','bonuses','employee-create-edit','navigation','onboarding','dashboard-charts','payroll','benefits','close','payment','receipt','dre-import','dre-export','manager-dre','employee-gps','space','staff','event','edit']});
         await context.close();
