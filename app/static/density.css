@@ -105,6 +105,30 @@
 .employee-body .employee-pay{max-width:560px}
 .app main .employee-body .employee-totals{grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:12px 0}
 .employee-body .employee-details dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:24px}
+.management-board{display:grid;grid-template-columns:repeat(var(--board-columns,3),minmax(260px,1fr));gap:12px;align-items:start;overflow-x:auto;scroll-snap-type:x proximity;padding:4px 2px 12px;max-width:100%}
+.management-column{min-width:0;border:1px solid var(--line);border-radius:12px;padding:10px;scroll-snap-align:start}
+.management-column>header{border-bottom:1px solid var(--line);margin-bottom:10px}
+.app main .management-column>header h2{display:flex;align-items:center;gap:8px;font:600 15px Outfit,sans-serif;margin:0 0 6px}
+.management-column>header .sub{font-size:12px}
+.management-cards{display:grid;gap:8px}
+.management-card{min-width:0;overflow-wrap:anywhere}
+.management-card h3{overflow-wrap:anywhere}
+.management-card details{margin-top:10px}
+.management-card summary,.management-create summary{cursor:pointer;min-height:30px;font-weight:500;font-size:13px}
+.management-person{display:flex;flex-direction:column;gap:2px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}
+.management-person span{color:var(--mute)}
+.management-edit label{display:grid;gap:4px;margin-top:8px;font-size:12px;color:var(--mute)}
+.management-edit input,.management-edit select{width:100%;min-width:0}
+.management-endpoint,.management-description{font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+.management-toolbar label{display:grid;gap:4px;flex:1 1 220px;max-width:420px;font-size:12px;color:var(--mute)}
+.management-toolbar .sub{flex:initial;margin:0}
+.management-create{margin-top:10px}
+.management-create .row{align-items:end}
+.management-create label{display:grid;gap:4px;flex:1 1 160px;font-size:12px;color:var(--mute)}
+.management-create input,.management-create select{width:100%;min-width:0}
+.management-card[hidden],.management-empty[hidden]{display:none}
+@media(max-width:720px),(pointer:coarse){.management-card summary,.management-create summary{min-height:44px}.management-toolbar label{max-width:none}.management-board{grid-template-columns:repeat(var(--board-columns,3),minmax(280px,1fr))}}
+@media print{.management-board{display:block;overflow:visible}.management-column{break-inside:avoid;margin-bottom:12px}.management-toolbar,.management-create{display:none}}
 
 @media(min-width:721px) and (pointer:fine){
  .app main :is(input,select,textarea),.task-dialog :is(input,select),.acct-dialog :is(input,select){min-height:30px;padding:5px 8px;font-size:13px}

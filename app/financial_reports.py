@@ -142,6 +142,19 @@ def parse_csv(m, payload, who, c):
 
 
 def register_routes(m):
+    @m.app.get('/finance/dre/modelo.xlsx', dependencies=[Depends(m.manager_or_admin)])
+    def export_model(start:str,end:str,department_id:int|None=None,who=Depends(m.principal)):
+        if who['role'] not in ('admin','manager'):
+            raise HTTPException(403,'A exportação da DRE exige acesso de gestor.')
+        from app.dre_xlsx import export_workbook
+        result=report(m,start,end,who,department_id)
+        selected=scope(who,department_id)
+        result['scope_label']=next((d['name'] for d in result['departments'] if d['id']==selected),'Todos os setores')
+        with m.db() as c:
+            company_row=c.execute("SELECT v FROM settings WHERE k='co_name'").fetchone()
+            company=company_row['v'] if company_row and company_row['v'] else 'SIGI'
+        return Response(export_workbook(result,company),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="dre-modelo-{start}-{end}.xlsx"','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'})
+
     @m.app.get('/finance/dre/statement.csv', dependencies=[Depends(m.manager_or_admin)])
     def statement_csv(start:str,end:str,department_id:int|None=None,who=Depends(m.principal)):
         result=report(m,start,end,who,department_id)
