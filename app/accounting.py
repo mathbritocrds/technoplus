@@ -226,6 +226,28 @@ def statement(totals):
              'subtotal':label.startswith('(=)'), 'revenue_pct':round(amount/t('revenue')*100,2) if t('revenue') else None} for key,label,amount,required in rows]
 
 
+def inter_statement(totals):
+    """Workbook presentation over the ledger, preserving every result category."""
+    t=lambda key:int(totals.get(key,0))
+    net_revenue=t('revenue')+t('deductions');gross=net_revenue+t('cost')
+    operating=gross+t('operating')+t('other_operating')
+    diverse=t('investment')+t('financing')
+    net=operating+diverse+t('income_tax')+t('discontinued')
+    rows=[('revenue','(+) Receita operacional',t('revenue')),('tax','(-) Impostos e deduções',-t('deductions')),
+        ('net_revenue','(=) Receita líquida',net_revenue),('cost','(-) Custos diretos',-t('cost')),
+        ('gross_profit','(=) Lucro bruto',gross),('selling_expenses','(-) Despesas de vendas',0),
+        ('operating_expenses','(-) Despesas operacionais (fixas)',-t('operating'))]
+    if t('other_operating'):
+        rows.append(('other_operating','(+/-) Outros resultados operacionais',t('other_operating')))
+    rows.extend([('operating_profit','(=) Lucro operacional',operating),
+                 ('financial_result','(+/-) Receitas/despesas diversas',diverse)])
+    if t('income_tax'):rows.append(('income_tax','(-) IRPJ e CSLL',-t('income_tax')))
+    if t('discontinued'):rows.append(('discontinued','(+/-) Operações descontinuadas',t('discontinued')))
+    rows.append(('net_profit','(=) Lucro/prejuízo',net))
+    return [dict(key=key,label=label,amount_cents=value,subtotal=label.startswith('(=)'),
+        revenue_pct=round(value/t('revenue')*100,2) if t('revenue') else None) for key,label,value in rows]
+
+
 def report(m: AppServices,c,start,end,department_id):
     items=balances(m,c,start,end,department_id);totals={}
     for item in items:
@@ -242,7 +264,7 @@ def report(m: AppServices,c,start,end,department_id):
     sums={key:sum(r['amount_cents'] for r in values) for key,values in sections.items()}
     asset=sums['current_assets']+sums['noncurrent_assets'];other=sums['current_liabilities']+sums['noncurrent_liabilities']+sums['equity']
     debit=sum(r['debit'] for r in items);credit=sum(r['credit'] for r in items)
-    return {'start':start,'end':end,'department_id':department_id,'dre':dre,'balance':{'sections':sections,'totals':sums,
+    return {'start':start,'end':end,'department_id':department_id,'dre':dre,'inter_dre':inter_statement(totals),'balance':{'sections':sections,'totals':sums,
             'assets_cents':asset,'liabilities_equity_cents':other,'difference_cents':asset-other,'balanced':asset==other},
             'trial':{'items':items,'debit_cents':debit,'credit_cents':credit,'difference_cents':debit-credit,
                      'balanced':debit==credit and sum(r['closing'] for r in items)==0}}
@@ -318,14 +340,17 @@ def _register_report_routes(m: AppServices):
 
 
     @app.get('/accounting/export.csv')
-    def export(start:str,end:str,kind:Literal['dre','balance','trial']='dre',department_id:int|None=None,who=Depends(m.manager_or_admin)):
+    def export(start:str,end:str,kind:Literal['dre','dre_inter','balance','trial']='dre',department_id:int|None=None,who=Depends(m.manager_or_admin)):
         import csv,io
         from fastapi.responses import Response
         start,end=period(start,end);department=scoped(who,department_id)
         with connection(m,who) as c: result=report(m,c,start,end,department)
         out=io.StringIO();out.write('\ufeff');w=csv.writer(out,delimiter=';')
         def money(n):return format(Decimal(n)/100,'.2f').replace('.',',')
-        if kind=='dre':
+        if kind=='dre_inter':
+            w.writerow(['DRE — modelo Inter Empresas (escrituração)',start,end]);w.writerow(['Rubrica','Valor','% receita'])
+            for r in result['inter_dre']:w.writerow([m.csv_safe(r['label']),money(r['amount_cents']),(f"{r['revenue_pct']:.2f}".replace('.',',')+'%') if r['revenue_pct'] is not None else ''])
+        elif kind=='dre':
             w.writerow(['DRE CPC 51 / IFRS 18 — modelo industrial',start,end]);w.writerow(['Rubrica','Valor','% receita','Obrigatório'])
             for r in result['dre']:w.writerow([m.csv_safe(r['label']),money(r['amount_cents']),(f"{r['revenue_pct']:.2f}".replace('.',',')+'%') if r['revenue_pct'] is not None else '', 'Sim' if r['required'] else ''])
         elif kind=='balance':

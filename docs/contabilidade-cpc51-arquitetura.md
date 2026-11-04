@@ -54,7 +54,7 @@ Como as origens antigas armazenam competência mensal, seu reconhecimento usa o 
 
 Na área de integração, o administrador pode incorporar os dados anteriores até a data escolhida. Repetir a ação não duplica fontes. Para CSVs antigos da DRE, é necessário escolher a contrapartida patrimonial de receitas/despesas; sem escolha, eles permanecem pendentes. Isso evita presumir caixa, capital ou fornecedores para dados sem essa informação. Capital, estoque e demais saldos iniciais são registrados por lançamentos balanceados.
 
-A DRE da página Contas e DRE usa as origens operacionais e agora mostra a estrutura de 15 linhas. A DRE do módulo React usa exclusivamente a escrituração confirmada e inclui os lançamentos manuais adicionais. Os dois fundamentos são identificados nas telas. O CSV detalhado anterior continua disponível para importação; o CSV da demonstração apresenta a estrutura CPC 51.
+A página Contas e DRE usa as origens operacionais e o modelo da planilha Inter. A DRE do módulo React também apresenta o modelo Inter, usando exclusivamente a escrituração confirmada e incluindo lançamentos manuais. Resultados de investimento e financiamento compõem receitas/despesas diversas; outros resultados operacionais, IRPJ/CSLL e operações descontinuadas aparecem em linhas adicionais quando há saldo, mantendo o mesmo resultado líquido da estrutura CPC 51. As duas bases são identificadas nas telas. O botão Exportar DRE CSV do módulo React usa `kind=dre_inter`; a API/CSV CPC 51 anterior continua disponível por `kind=dre`.
 
 ## API
 
@@ -102,3 +102,6 @@ Toda edição de material pela aplicação gera auditoria antes/depois na mesma 
 - `npm run build`, `npm run typecheck` e `npm run test:ui`: desktop/celular e desenvolvimento/pacote de produção, com criação/estorno, relatórios, CSV, paginação, temas e fluxos anteriores.
 
 Os testes usam dados temporários e localização simulada. A migração e o deploy não foram executados no Supabase de produção; integrar o PR e atualizar o backend/arquivos estáticos é necessário para disponibilizar a alteração no sistema publicado.
+
+
+Scripts e estilos da interface usam `Cache-Control: no-cache, must-revalidate`; o service worker renova seu cache e revalida a rede. A composição anual de funcionários inclui gráfico, INSS, horas e custo/h na área Custos e gráficos.

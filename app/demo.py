@@ -250,7 +250,10 @@ class ScopedStaticFiles(StaticFiles):
                 content=re.sub(r'((?:src|href)=[\"\'])/(?!/)',lambda match:match[1]+escape(base,quote=True)+'/',content)
             content=content.replace('<head>','<head><script>globalThis.SIGI_CONTEXT='+config+';</script>',1)
             return HTMLResponse(content,headers={'Cache-Control':'no-store'})
-        return await super().get_response(path,scope)
+        response=await super().get_response(path,scope)
+        if path.endswith(('.js','.css')):
+            response.headers['Cache-Control']='no-cache, must-revalidate'
+        return response
 
 
 def mount(main: DemoRuntime):

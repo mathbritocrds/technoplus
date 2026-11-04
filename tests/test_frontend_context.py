@@ -19,3 +19,14 @@ def test_html_changes_are_visible_without_restarting_the_server(tmp_path):
     assert 'globalThis.SIGI_CONTEXT={"basePath":"/corp","demo":true}' in rendered
     assert 'src="/corp/business.js"' in rendered
     assert second.headers['cache-control']=='no-store'
+
+
+def test_code_assets_require_revalidation_including_annual_and_accounting(tmp_path):
+    for filename in ('business.js','accounting.bundle.js','accounting.css','service-worker.js'):
+        (tmp_path/filename).write_text('first')
+    files=ScopedStaticFiles(directory=str(tmp_path),html=True,
+        context=ContextVar('asset_demo',default=True),base_path_context=ContextVar('asset_base',default='/demo'))
+    for filename in ('business.js','accounting.bundle.js','accounting.css','service-worker.js'):
+        response=asyncio.run(files.get_response(filename,{'type':'http','method':'GET','headers':[]}))
+        assert response.status_code==200
+        assert response.headers['cache-control']=='no-cache, must-revalidate'

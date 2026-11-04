@@ -53,6 +53,7 @@ with sqlite3.connect(sys.argv[1]) as c:
    const formattedInss=await page.evaluate(value=>R(value),annual.inss);assert.equal(await page.locator('[data-annual-inss]').innerText(),formattedInss);
    assert((await page.locator('#annualEmployeeChart').innerText()).includes('10 h'));
    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+   await page.getByRole('button',{name:'Alternar tema claro ou escuro'}).click();
    await page.locator('#annualEmployeeComposition').screenshot({path:resolve(output,`annual-hourly-${build}-${viewport}.png`)});
    // Reopen the persisted contract and simulate the split at concession expiry.
    await page.evaluate(id=>openHR(id),eid);assert.equal(await page.locator('[data-profile="pay_basis"]').inputValue(),'hourly');
@@ -72,7 +73,20 @@ with sqlite3.connect(sys.argv[1]) as c:
    const section=page.locator('section').filter({has:page.getByRole('heading',{name:'DRE · modelo Inter Empresas',exact:true})}).last();
    await section.screenshot({path:resolve(output,`dre-inter-${build}-${viewport}.png`)});
    const downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'Exportar Excel (modelo)',exact:true}).click();const download=await downloadPromise;assert(download.suggestedFilename().endsWith('.xlsx'));assert.equal(await download.failure(),null);
-   assert.deepEqual(errors,[]);await context.close();verdict.push({build,viewport,ok:true,checks:['monthly-form-valid','hourly-normal-extra-dsr','annual-inss-chart-reconciled','vacation-partial-double','dre-inter-web-and-xlsx']});
+   // The first screenshot is a separate React accounting screen, also using Inter.
+   await page.evaluate(async()=>{await api('/accounting/journals','POST',{
+    booked_on:'2026-11-02',description:'Receita para conferir a tela',reference:'screen-inter-revenue',
+    lines:[{account_code:'1.1.01',debit:'1000'},{account_code:'4.1.01',credit:'1000'}]});await go('contabilidade',{first:true})});
+   await page.getByRole('heading',{name:'DRE · modelo Inter Empresas',exact:true}).waitFor();
+   const accounting=await page.evaluate(()=>api('/accounting/reports?start=2026-11-01&end=2026-11-30'));
+   assert.equal(await page.locator('[data-statement-row]').count(),accounting.inter_dre.length);
+   const expected=await page.evaluate(cents=>'R$ '+(cents/100).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}),accounting.inter_dre.find(row=>row.key==='net_profit').amount_cents);
+   assert((await page.locator('[data-statement-row="net_profit"]').innerText()).includes(expected));
+   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+   await page.locator('#accountingRoot').screenshot({path:resolve(output,`accounting-inter-${build}-${viewport}.png`)});
+   const accountingDownload=page.waitForEvent('download');await page.getByRole('button',{name:'Exportar DRE CSV',exact:true}).click();assert((await accountingDownload).suggestedFilename().endsWith('.csv'));
+   const code=await fetch(base+'/demo/business.js');assert.equal(code.headers.get('cache-control'),'no-cache, must-revalidate');
+   assert.deepEqual(errors,[]);await context.close();verdict.push({build,viewport,ok:true,checks:['monthly-form-valid','hourly-normal-extra-dsr','annual-inss-chart-reconciled','vacation-partial-double','dre-inter-web-and-xlsx','accounting-inter-screen-and-csv','current-code-assets']});
   }finally{if(server.exitCode===null){server.kill('SIGTERM');await new Promise(resolve=>server.once('exit',resolve))}}
  }
 }finally{await browser.close()}

@@ -1,4 +1,4 @@
-const CACHE = "sigi-shell-v15";
+const CACHE = "sigi-shell-v16";
 const BASE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
 const SHELL = ["/", "/business.js", "/corporate-controls.js", "/enhancements.js", "/enhancements.css", "/accounting.css", "/accounting.bundle.js", "/density.css", "/density.js", "/management-boards.js", "/service-worker.js", "/manifest.webmanifest", "/icon.svg"].map(path => BASE_PATH + path);
 
@@ -16,7 +16,7 @@ self.addEventListener("fetch", event => {
   const request = event.request;
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin || !SHELL.includes(url.pathname)) return;
-  event.respondWith(fetch(request).then(response => {
+  event.respondWith(fetch(request,{cache:'no-cache'}).then(response => {
     if (response.ok) caches.open(CACHE).then(cache => cache.put(url.pathname, response.clone()));
     return response;
   }).catch(async () => (await caches.match(url.pathname)) || Response.error()));
