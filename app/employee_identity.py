@@ -38,6 +38,26 @@ def _match(people, aliases, name, department_id=None):
     return None
 
 
+def department_lead(connection, employee_id=None, name='', department_id=None):
+    """One rule for explicit department changes and safe legacy recovery."""
+    if employee_id is None and name.strip():
+        matches=connection.execute('SELECT id FROM employees WHERE active=1 AND lower(name)=lower(?)',(name.strip(),)).fetchall()
+        if len(matches)!=1:
+            raise HTTPException(400,'Selecione um funcionário ativo cadastrado como chefe do departamento.')
+        employee_id=matches[0]['id']
+    if employee_id is None:
+        return None,''
+    person=connection.execute('SELECT id,name,department_id FROM employees WHERE id=? AND active=1',(employee_id,)).fetchone()
+    if not person:
+        raise HTTPException(400,'Chefe deve ser um funcionário ativo cadastrado.')
+    if person['department_id'] is not None and person['department_id']!=department_id:
+        raise HTTPException(400,'O chefe já pertence a outro departamento. Transfira-o antes.')
+    others=connection.execute('SELECT id FROM departments WHERE lead_employee_id=?',(employee_id,)).fetchall()
+    if any(row['id']!=department_id for row in others):
+        raise HTTPException(400,'Este funcionário já é chefe de outro departamento.')
+    return employee_id,person['name']
+
+
 def link_legacy_references(connection):
     """Recover unambiguous links, including names retained in immutable snapshots."""
     if not connection.execute("SELECT 1 FROM settings WHERE k='employee_identity_v1'").fetchone():
@@ -61,20 +81,38 @@ def link_legacy_references(connection):
             if row['lead_employee_id'] in people:
                 _remember(connection,row['lead_employee_id'],row['lead'])
         connection.execute("INSERT INTO settings(k,v) VALUES('employee_identity_v1','1') ON CONFLICT(k) DO NOTHING")
+    for employee in connection.execute('SELECT id FROM employees WHERE active=1 AND department_id IS NULL').fetchall():
+        linked=connection.execute('SELECT id FROM departments WHERE lead_employee_id=?',(employee['id'],)).fetchall()
+        if len(linked)==1:
+            department_lead(connection,employee['id'],department_id=linked[0]['id'])
+            connection.execute('UPDATE employees SET department_id=? WHERE id=?',(linked[0]['id'],employee['id']))
     people,aliases=_directory(connection)
-    for task in connection.execute("SELECT id,assignee,department_id FROM tasks WHERE assignee_employee_id IS NULL AND assignee<>''").fetchall():
+    for task in connection.execute("SELECT id,assignee,department_id FROM tasks WHERE assignee_employee_id IS NULL AND assignee_external=0 AND assignee<>''").fetchall():
         person=_match(people,aliases,task['assignee'],task['department_id'])
         if person:
             connection.execute('UPDATE tasks SET assignee_employee_id=?,assignee=? WHERE id=?',
                                (person['id'],person['name'],task['id']))
+    # Resolve all candidates before writing: two legacy sectors must not claim
+    # the same employee merely because the first update changed the directory.
+    proposals=defaultdict(list)
     for department in connection.execute("SELECT id,lead FROM departments WHERE lead_employee_id IS NULL AND lead<>''").fetchall():
         person=_match(people,aliases,department['lead'],department['id'])
-        if person and person['department_id'] in (None,department['id']):
-            connection.execute('UPDATE departments SET lead_employee_id=?,lead=? WHERE id=?',
-                               (person['id'],person['name'],department['id']))
+        if person and person['active'] and person['department_id'] in (None,department['id']):
+            proposals[person['id']].append(department['id'])
+    for eid,departments in proposals.items():
+        if len(departments)!=1 or connection.execute(
+                'SELECT 1 FROM departments WHERE lead_employee_id=?',(eid,)).fetchone():
+            continue
+        did=departments[0]
+        _,name=department_lead(connection,eid,department_id=did)
+        connection.execute('UPDATE departments SET lead_employee_id=?,lead=? WHERE id=?',
+                           (eid,name,did))
+        connection.execute('UPDATE employees SET department_id=? WHERE id=?',(did,eid))
 
 
-def assignment(connection, name='', employee_id=None, department_id=None):
+def assignment(connection, name='', employee_id=None, department_id=None, *, external=False):
+    if external and employee_id is None:
+        return name.strip(),None
     if employee_id is not None:
         person=connection.execute('SELECT id,name,active FROM employees WHERE id=?',(employee_id,)).fetchone()
         if not person or not person['active']:
@@ -83,13 +121,18 @@ def assignment(connection, name='', employee_id=None, department_id=None):
     if not _key(name):
         return '',None
     people,aliases=_directory(connection)
-    # An explicit current name takes precedence over a former employee alias.
+    # Current names take precedence over aliases, but ambiguity requires an ID.
     current=defaultdict(set)
     for eid,employee in people.items():
         current[_key(employee['name'])].add(eid)
-    person=_match(people,current,name,department_id) or _match(people,aliases,name,department_id)
+    candidates=current if current.get(_key(name)) else aliases
+    person=_match(people,candidates,name,department_id)
     if person:
+        if not person['active']:
+            raise HTTPException(404,'Funcionário responsável não encontrado ou inativo.')
         return person['name'],person['id']
+    if candidates.get(_key(name)):
+        raise HTTPException(409,'Há funcionários com esse nome. Selecione o responsável pelo cadastro.')
     return name.strip(),None
 
 

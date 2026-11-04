@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS products(
 CREATE TABLE IF NOT EXISTS tasks(
   id INTEGER PRIMARY KEY, title TEXT NOT NULL, assignee TEXT DEFAULT '',
   assignee_employee_id INTEGER REFERENCES employees(id),
+  assignee_external INTEGER NOT NULL DEFAULT 0,
   due TEXT DEFAULT '', status INTEGER DEFAULT 0,
   priority TEXT DEFAULT 'media', progress INTEGER DEFAULT 0,
   approval TEXT DEFAULT 'pendente', severity TEXT DEFAULT 'normal',
@@ -188,7 +189,8 @@ SCHEMA += SQLITE_GUARDS
 MIGRATIONS += BUSINESS_MIGRATIONS
 MIGRATIONS += ["ALTER TABLE transactions ADD COLUMN ledger_ref TEXT NOT NULL DEFAULT ''",
                "ALTER TABLE tasks ADD COLUMN assignee_employee_id INTEGER REFERENCES employees(id)",
-               "CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id)"]
+               "CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id)",
+               "ALTER TABLE tasks ADD COLUMN assignee_external INTEGER NOT NULL DEFAULT 0"]
 
 _demo_context = ContextVar("sigi_demo", default=False)
 _app_base_context = ContextVar("sigi_base_path", default="")
@@ -241,8 +243,6 @@ with db() as c:
 with db() as c:
     c.execute('BEGIN IMMEDIATE')
     migrate_clock_gps_default(c)
-    c.execute("UPDATE departments SET lead_employee_id=(SELECT MIN(e.id) FROM employees e WHERE e.active=1 AND lower(e.name)=lower(departments.lead) AND (e.department_id IS NULL OR e.department_id=departments.id)) WHERE lead_employee_id IS NULL AND lead<>'' AND (SELECT COUNT(*) FROM employees e WHERE e.active=1 AND lower(e.name)=lower(departments.lead))=1 AND (SELECT COUNT(*) FROM departments d WHERE lower(d.lead)=lower(departments.lead))=1")
-    c.execute("UPDATE employees SET department_id=(SELECT MIN(d.id) FROM departments d WHERE d.lead_employee_id=employees.id) WHERE department_id IS NULL AND EXISTS(SELECT 1 FROM departments d WHERE d.lead_employee_id=employees.id)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_transaction_source ON transactions(source_key) WHERE source_key<>''")
     c.execute("UPDATE transactions SET category='revenue' WHERE kind='receber' AND category='operating'")
     c.execute("INSERT INTO payment_history(transaction_id,kind,description,amount,category,competence,paid_at,actor,department_id,source_key) SELECT id,kind,description,amount,category,CASE WHEN competence='' THEN substr(due,1,7) ELSE competence END,COALESCE(paid_at,due||'T12:00:00+00:00'),'legacy-import',department_id,source_key FROM transactions WHERE paid=1 AND NOT EXISTS (SELECT 1 FROM payment_history h WHERE h.transaction_id=transactions.id) ON CONFLICT(transaction_id) DO NOTHING")
@@ -622,6 +622,8 @@ async def audit_mutations(request, call_next):
     response = (JSONResponse({"detail": "Sua função não tem permissão para esta ação."}, status_code=403)
                 if denied else await call_next(request))
     operation_path=path[5:] if _demo_context.get() else path
+    if operation_path == '/clock/tasks':
+        response.headers['Cache-Control'] = 'no-store'
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and operation_path not in {
         "/auth/login", "/auth/employee/login", "/auth/sign-in", "/auth/register", "/auth/logout",
     }:
@@ -1641,6 +1643,7 @@ def create_employee_account(eid: int, b: EmployeeAccount):
         try:
             c.execute("UPDATE employees SET account_email=?,account_salt=?,account_hash=? WHERE id=?",
                       (email, salt, hash_pin(b.password, salt), eid))
+            c.execute("DELETE FROM sessions WHERE role='employee' AND subject_id=?", (eid,))
         except (sqlite3.IntegrityError, psycopg2.IntegrityError):
             raise HTTPException(409, "Este e-mail já possui uma conta de funcionário.")
     return {"email": email}
@@ -1926,14 +1929,15 @@ def add_task(t: TaskIn, background: BackgroundTasks, who=Depends(admin_context))
     t = norm_task(t)
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
-        assignee, assignee_id = employee_identity.assignment(c, t.assignee, t.assignee_employee_id, t.department_id)
+        external = 'assignee_employee_id' in t.model_fields_set and t.assignee_employee_id is None and bool(t.assignee.strip())
+        assignee, assignee_id = employee_identity.assignment(c, t.assignee, t.assignee_employee_id, t.department_id, external=external)
         if t.department_id is not None and not c.execute("SELECT 1 FROM departments WHERE id=?",
                                                          (t.department_id,)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
         cur = c.execute("INSERT INTO tasks(title,assignee,due,status,priority,progress,approval,severity,"
-                        "department_id,labor_budget_hours,cost_ceiling,assignee_employee_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                        "department_id,labor_budget_hours,cost_ceiling,assignee_employee_id,assignee_external) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
                         (t.title, assignee, t.due, t.status, t.priority, t.progress, t.approval,
-                         t.severity, t.department_id, t.labor_budget_hours, t.cost_ceiling, assignee_id))
+                         t.severity, t.department_id, t.labor_budget_hours, t.cost_ceiling, assignee_id, int(external)))
         task_id = cur.fetchall()[0]["id"]
         task_history(c, task_id, who["user"], "Criação", f"Tarefa criada: {t.title}.")
         if t.status in (1, 2):
@@ -2270,7 +2274,9 @@ def move_task(tid: int, status: int, background: BackgroundTasks, who=Depends(ad
 
 @app.patch("/tasks/{tid}", dependencies=[Depends(admin)])
 def edit_task(tid: int, p: TaskPatch, background: BackgroundTasks, who=Depends(admin_context)):
-    data = {k: v for k, v in p.model_dump().items() if v is not None}
+    data = p.model_dump(exclude_unset=True)
+    if any(value is None for key,value in data.items() if key not in ('department_id','assignee_employee_id')):
+        raise HTTPException(422, "Somente departamento e vínculo do responsável podem ser removidos com valor nulo.")
     if 'assignee_employee_id' in p.model_fields_set and p.assignee_employee_id is None and 'assignee' not in p.model_fields_set:
         data['assignee'] = ''
     if "priority" in data and data["priority"] not in PRI: raise HTTPException(400, "Prioridade inválida.")
@@ -2286,12 +2292,24 @@ def edit_task(tid: int, p: TaskPatch, background: BackgroundTasks, who=Depends(a
             linked = p.assignee_employee_id
             if 'assignee_employee_id' not in p.model_fields_set and data.get('assignee','').strip() == old['assignee']:
                 linked = old['assignee_employee_id']
-            name, eid = employee_identity.assignment(c, data.get('assignee',''), linked,
-                                                      data.get('department_id',old['department_id']))
-            data.update(assignee=name, assignee_employee_id=eid)
+            unchanged = linked == old['assignee_employee_id'] and (
+                'assignee' not in data or data['assignee'].strip() == old['assignee'])
+            external = 'assignee_employee_id' in p.model_fields_set and p.assignee_employee_id is None and bool(data.get('assignee','').strip())
+            if external:
+                data.update(assignee=data['assignee'].strip(), assignee_employee_id=None, assignee_external=1)
+            elif unchanged:
+                # Keeping an archived owner is valid; only new assignments need
+                # an active employee. Preserve legacy free text on unrelated edits.
+                data.update(assignee=old['assignee'], assignee_employee_id=linked)
+            else:
+                name, eid = employee_identity.assignment(c, data.get('assignee',''), linked,
+                                                          data.get('department_id',old['department_id']))
+                data.update(assignee=name, assignee_employee_id=eid, assignee_external=0)
         if data.get("department_id") is not None and not c.execute(
                 "SELECT 1 FROM departments WHERE id=?", (data["department_id"],)).fetchone():
             raise HTTPException(404, "Departamento não encontrado.")
+        if old['status'] == 0 and data.get('status',old['status']) in (1,2):
+            consume_task_materials(c, tid, background)
         cur = c.execute(f"UPDATE tasks SET {','.join(k+'=?' for k in data)} WHERE id=?", (*data.values(), tid))
         for key, value in data.items():
             if value != old[key]:
@@ -2301,7 +2319,8 @@ def edit_task(tid: int, p: TaskPatch, background: BackgroundTasks, who=Depends(a
                           "labor_budget_hours": "horas orçadas", "cost_ceiling": "teto de custo"}
                 task_history(c, tid, who["user"], labels.get(key, key),
                              f"{labels.get(key, key).capitalize()} alterado de {old[key] or 'vazio'} para {value}.")
-        if "progress" in data and data["progress"] == 100 and old["progress"] != 100:
+        if ('status' in data and data['status'] != old['status']) or (
+                data.get('progress') == 100 and old['progress'] != 100):
             run_task_automations(c, tid, background)
     return {"ok": True}
 
@@ -2581,18 +2600,7 @@ class DeptIn(BaseModel):
 
 def department_lead(c, d, did=None):
     if not d.name.strip(): raise HTTPException(400,"Informe o nome do departamento.")
-    employee_id = d.lead_employee_id
-    if employee_id is None and d.lead.strip():
-        matches = c.execute("SELECT id FROM employees WHERE active=1 AND lower(name)=lower(?)", (d.lead.strip(),)).fetchall()
-        if len(matches) != 1:
-            raise HTTPException(400, "Selecione um funcionário ativo cadastrado como chefe do departamento.")
-        employee_id = matches[0]['id']
-    if employee_id is None: return None, ''
-    e = c.execute("SELECT id,name,department_id FROM employees WHERE active=1 AND id=?", (employee_id,)).fetchone()
-    if not e: raise HTTPException(400, "Chefe deve ser um funcionário ativo cadastrado.")
-    if e['department_id'] is not None and e['department_id'] != did:
-        raise HTTPException(400, "O chefe já pertence a outro departamento. Transfira-o antes.")
-    return employee_id, e['name']
+    return employee_identity.department_lead(c,d.lead_employee_id,d.lead,did)
 
 @app.post("/departments", dependencies=[Depends(admin)], status_code=201)
 def add_dept(d: DeptIn):
@@ -3117,14 +3125,19 @@ class EmployeeClock(BaseModel):
     samples: list[Sample] = Field(min_length=1, max_length=20)
     task_id: Optional[int] = None
 
-@app.get("/clock/tasks")
-def clock_tasks(employee_id: int, pin: str, request: Request):
+class ClockTaskLookup(BaseModel):
+    employee_id: int = Field(gt=0)
+    pin: str = Field(min_length=4, max_length=8, pattern=r"^\d+$")
+
+@app.post("/clock/tasks")
+def clock_tasks(payload: ClockTaskLookup, request: Request, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
     with db() as c:
-        employee = check_employee(c, employee_id, pin, request.client.host if request.client else "unknown")
+        employee = check_employee(c, payload.employee_id, payload.pin, request.client.host if request.client else "unknown")
         verify_clock_ip(request.client.host if request.client else "", settings(c))
         return rows(c.execute(
             "SELECT id,title,due FROM tasks WHERE status=1 AND (assignee='' OR assignee_employee_id=?) "
-            "ORDER BY due,id", (employee_id,)))
+            "ORDER BY due,id", (payload.employee_id,)))
 
 def entry_hash(prev, nsr, cpf, at, eid, kind, lat, lng):
     return hashlib.sha256(f"{prev}|{nsr}|{cpf}|{at}|{eid}|{kind}|{lat:.6f}|{lng:.6f}".encode()).hexdigest()

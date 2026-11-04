@@ -57,7 +57,7 @@ def test_rename_updates_tasks_departments_clock_portal_and_messages(service):
     assert client.get('/employee/summary',headers=session).json()['employee']['name']=='Ana Torres'
     assert client.get('/departments',headers=auth).json()[0]['lead']=='Ana Torres'
     assert client.get('/clock/employees').json()[0]['name']=='Ana Torres'
-    assert tid in [item['id'] for item in client.get(f'/clock/tasks?employee_id={eid}&pin=1234').json()]
+    assert tid in [item['id'] for item in client.post('/clock/tasks',json={'employee_id':eid,'pin':'1234'}).json()]
     message=client.get('/messages',headers=auth).json()[0]
     assert message['sender_name']=='Ana Torres' and message['recorded_sender_name']=='Ana Lima'
     with main.db() as c:
@@ -99,7 +99,9 @@ def test_homonyms_keep_separate_task_ownership_and_free_text_is_not_replaced(ser
     first_task=task(service,assignee_employee_id=first)
     second_task=task(service,assignee_employee_id=second)
     external=task(service,assignee='Ana Lima Consultoria')
-    ambiguous=task(service,assignee='Ana Lima')
+    assert client.post('/tasks',headers=auth,json={'title':'Ambígua','assignee':'Ana Lima'}).status_code==409
+    with main.db() as c:
+        ambiguous=c.execute("INSERT INTO tasks(title,assignee) VALUES('Legado ambíguo','Ana Lima') RETURNING id").fetchone()[0]
     assert client.patch(f'/employees/{first}',headers=auth,json={'name':'Ana Torres'}).status_code==200
     tasks={row['id']:row for row in client.get('/tasks',headers=auth).json()}
     assert tasks[first_task]['assignee']=='Ana Torres'

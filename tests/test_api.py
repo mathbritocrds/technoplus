@@ -618,5 +618,5 @@ def test_tarefa_em_andamento_aparece_no_seletor_de_ponto(auth):
     task_id = client.post("/tasks", json={"title": "Montagem atribuída",
                                           "assignee": "Tarefa no ponto"}, headers=auth).json()["id"]
     client.patch(f"/tasks/{task_id}/status/1", headers=auth)
-    tasks = client.get(f"/clock/tasks?employee_id={employee_id}&pin=7654").json()
+    tasks = client.post("/clock/tasks",json={"employee_id":employee_id,"pin":"7654"}).json()
     assert any(task["id"] == task_id for task in tasks)

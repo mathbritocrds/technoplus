@@ -557,3 +557,6 @@ ALTER TABLE employee_name_aliases ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON employee_name_aliases FROM anon,authenticated;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_employee_id BIGINT REFERENCES employees(id);
 CREATE INDEX IF NOT EXISTS ix_task_employee ON tasks(assignee_employee_id);
+
+-- Preserve explicit external task owners across legacy identity recovery.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_external INTEGER NOT NULL DEFAULT 0;
