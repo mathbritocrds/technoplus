@@ -1,6 +1,6 @@
-const CACHE = "sigi-shell-v16";
+const CACHE = "sigi-shell-v17";
 const BASE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
-const SHELL = ["/", "/business.js", "/corporate-controls.js", "/enhancements.js", "/enhancements.css", "/accounting.css", "/accounting.bundle.js", "/density.css", "/density.js", "/management-boards.js", "/service-worker.js", "/manifest.webmanifest", "/icon.svg"].map(path => BASE_PATH + path);
+const SHELL = ["/charts.js", "/charts.css", "/", "/business.js", "/corporate-controls.js", "/enhancements.js", "/enhancements.css", "/accounting.css", "/accounting.bundle.js", "/density.css", "/density.js", "/management-boards.js", "/service-worker.js", "/manifest.webmanifest", "/icon.svg"].map(path => BASE_PATH + path);
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

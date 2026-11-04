@@ -1,0 +1,23 @@
+import {chromium} from 'playwright';import {spawn} from 'node:child_process';import {mkdtempSync,mkdirSync} from 'node:fs';import {tmpdir} from 'node:os';import {resolve} from 'node:path';import assert from 'node:assert/strict';
+const output='/workspace/screenshots';mkdirSync(output,{recursive:true});
+const browser=await chromium.launch({headless:true,executablePath:'/usr/bin/chromium',args:['--no-sandbox','--disable-dev-shm-usage']});const verdict=[];
+try{for(const [build,cwd] of [['dev',resolve('.')],['built',resolve('dist/sigi')]])for(const [viewport,width] of [['desktop',1280],['mobile',390]]){
+ const folder=mkdtempSync(resolve(tmpdir(),'sigi-chart-')),base='http://127.0.0.1:18251';
+ const server=spawn('python',['-m','uvicorn','app.main:app','--host','127.0.0.1','--port','18251'],{cwd,env:{...process.env,DB_PATH:folder+'/prod.db',DEMO_DB_PATH:folder+'/demo.db',SUPABASE_DATABASE_URL:''},stdio:'ignore'});
+ try{let ready=false;for(let n=0;n<100;n++){try{if((await fetch(base+'/auth/status')).ok){ready=true;break}}catch{}await new Promise(r=>setTimeout(r,100))}assert(ready);
+ const context=await browser.newContext({viewport:{width,height:1000},reducedMotion:'reduce'});await context.route('https://fonts.googleapis.com/**',r=>r.fulfill({contentType:'text/css',body:'body{font-family:Arial}'}));const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text())});
+ await page.goto(base+'/demo/',{waitUntil:'networkidle'});await page.locator('[data-chart-key="report:Resultado por mês"]').waitFor();
+ const exercise=async(key,selected=null)=>{const host=page.locator(`[data-chart-key="${key}"]`);await host.waitFor();const before=await host.getAttribute('data-chart-spec'),options=await host.locator('select').first().locator('option').evaluateAll(nodes=>nodes.map(node=>node.value));for(const type of selected||options){assert(options.includes(type),key+' missing '+type);await host.locator('select').first().selectOption(type);assert.equal(await host.getAttribute('data-chart-type'),type);assert.equal(await host.getAttribute('data-chart-spec'),before);const text=await host.locator('[data-chart-output]').innerText();assert(!text.includes('NaN'));assert(!text.includes('Infinity'));assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),build+'/'+viewport+' '+key+' overflow')}return host};
+ await exercise('report:Resultado por mês',['bars','columns','line','table']);await exercise('report:Gastos por setor',['bars','columns','donut','table']);await exercise('task-stages',['columns','donut']);
+ await page.getByText('Ver mais gráficos',{exact:true}).click();await exercise('attendance',['line','columns']);await exercise('dashboard-finance',['bars','columns']);
+ await page.screenshot({path:resolve(output,`chart-types-dashboard-${build}-${viewport}.png`),fullPage:true});
+ await page.evaluate(async()=>{await go('folha',{first:true})});await page.getByRole('button',{name:'Custos e gráficos',exact:true}).click();
+ await exercise('hr-composition',['donut','columns']);await exercise('hr-comparison',['columns','table']);
+ await page.locator('#annualEmployeeComposition > summary').click();await exercise('annual-employee',['bars','columns','donut','table','donut']);
+ const employeeOptions=await page.locator('#annualCompositionEmployee option').evaluateAll(nodes=>nodes.map(node=>node.value));if(employeeOptions.length>1){await page.locator('#annualCompositionEmployee').selectOption(employeeOptions[1]);assert.equal(await page.locator('[data-chart-key="annual-employee"]').getAttribute('data-chart-type'),'donut')}
+ await page.getByRole('button',{name:'Alternar tema claro ou escuro'}).click();await page.locator('#annualEmployeeComposition').screenshot({path:resolve(output,`chart-types-annual-${build}-${viewport}.png`)});
+ await page.evaluate(async()=>{await go('financeiro',{first:true})});await page.getByRole('button',{name:'DRE e fluxo',exact:true}).click();await exercise('department-costs',['bars','columns','donut','table']);
+ await page.evaluate(async()=>{await go('painel',{first:true})});assert.equal(await page.locator('[data-chart-key="report:Gastos por setor"]').getAttribute('data-chart-type'),'table');
+ assert.deepEqual(errors,[]);await context.close();verdict.push({build,viewport,ok:true,checks:['bars-columns-lines-donut-table','unchanged-data','saved-view','annual-employee-switch','no-overflow','no-console-errors']});
+ }finally{if(server.exitCode===null){server.kill('SIGTERM');await new Promise(r=>server.once('exit',r))}}
+}}finally{await browser.close()}console.log(JSON.stringify(verdict,null,2));
