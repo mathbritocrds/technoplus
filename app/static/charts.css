@@ -2,3 +2,4 @@
 .grid>:has(.graph-switch),.dash-charts>:has(.graph-switch){min-width:0}.gc-scroll{min-width:0;width:100%;box-sizing:border-box}.gc-columns{width:max-content;min-width:100%}
 
 .gc-donut-layout:has(>.gc-donut:only-child){justify-content:center}
+.gc-scroll:has(>.gc-line){padding-bottom:80px}

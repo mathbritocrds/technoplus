@@ -5,7 +5,7 @@
  const storageKey='sigi-chart-types:'+(globalThis.SIGI_CONTEXT?.basePath||'');
  try{Object.assign(preferences,JSON.parse(sessionStorage.getItem(storageKey)||'{}'))}catch{}
  const format=(value,unit)=>new Intl.NumberFormat('pt-BR',unit==='number'?{maximumFractionDigits:2}:{style:'currency',currency:'BRL'}).format(value);
- function types(rows,options){return [['original','Gráfico atual'],['bars','Barras'],['columns','Colunas'],...(options.timeline?[['line','Linhas']]:[]),...(options.share&&rows.every(row=>row.value>=0)?[['donut','Rosca']]:[]),['table','Tabela']]}
+ function types(rows,options){return [['original','Gráfico atual'],['bars','Barras'],['columns','Colunas'],['line','Linhas'],...(options.share&&rows.every(row=>row.value>=0)?[['donut','Rosca']]:[]),['table','Tabela']]}
  function normalize(rows){return rows.map(row=>({label:String(row.label??''),value:Number.isFinite(Number(row.value))?Number(row.value):0,color:['b','g','o','r','mute','y'].includes(row.color)?row.color:'b'}))}
  function content(spec,type){
   const {rows,options,original}=spec,unit=options.unit||'money';

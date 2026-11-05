@@ -5,7 +5,7 @@ Os gráficos do painel, presença, tarefas, custos por setor, RH e composição 
 - **Gráfico atual** mantém o desenho anterior, incluindo divisões e indicadores existentes.
 - **Barras** facilita comparar categorias, com eixo zero e valores negativos preservados.
 - **Colunas** mostra categorias ou períodos lado a lado; séries extensas têm rolagem dentro do gráfico.
-- **Linhas** aparece nas séries por mês/dia e mantém a ordem cronológica recebida.
+- **Linhas** está disponível em todos os seletores. Nas séries por mês/dia mantém a ordem cronológica recebida; nas comparações de categorias conecta os pontos na ordem exibida.
 - **Rosca** aparece apenas em conjuntos de composição não negativos, como gastos por setor, partes do custo e etapas das tarefas. Resultados que misturam receitas, custos e lucro não oferecem rosca, pois esses valores não são partes de um mesmo total.
 - **Tabela** apresenta os valores e rótulos para consulta direta. Linhas também permitem abrir os valores abaixo do desenho.
 
