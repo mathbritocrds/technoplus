@@ -12,3 +12,8 @@ Os gráficos do painel, presença, tarefas, custos por setor, RH e composição 
 A escolha é salva por gráfico na sessão do navegador, separando os caminhos da empresa e da demonstração. Ao trocar o funcionário ou o período, o tipo continua selecionado quando for compatível com os novos valores. Dados vazios ou zerados não geram divisões por zero; rótulos são tratados como texto.
 
 A implementação fica em `app/static/charts.js` e `charts.css`, sem dependências externas ou requisições para serviços de gráficos. Os assets entram no build e no cache offline atualizado. Testes: `scripts/chart-types.test.mjs` e `scripts/qa-chart-types.mjs`, com fluxo real em desenvolvimento/compilado, desktop/celular, preservação de dados, preferências, tema escuro e ausência de erros de console.
+
+
+Nos gráficos de comparação por setor, Linhas desenha uma série independente para cada ID de departamento, com cor estável entre as telas, legenda e tabela de valores. No painel, resultado, receita e gastos são comparados por mês; no custeio financeiro, as linhas comparam pago, em aberto e folha. No RH, comparam componentes do custo ou totais líquido/custo por setor. A visão anual atribui cada mês ao setor registrado naquela folha, preservando transferências e fechamentos. Sem setor tem uma série própria; departamentos com nomes iguais são diferenciados pelo ID. Gráficos individuais de funcionário continuam restritos à pessoa selecionada.
+
+Em séries mensais longas no celular, o gráfico inicia pelos meses mais recentes e mantém rolagem horizontal para consultar os anteriores. As cores se adaptam aos temas claro/escuro. Valores negativos são preservados e valores indisponíveis interrompem a linha, em vez de virar zeros inventados.

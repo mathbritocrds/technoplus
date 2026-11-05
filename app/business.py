@@ -386,9 +386,11 @@ def _register_payroll_closing_routes(m: AppServices):
     @app.get('/payroll/annual-cost', dependencies=[Depends(m.admin)])
     def annual(year: int = 2026):
         consolidated = {}
+        department_composition={}
         closed_months = []
         with m.db() as c:
             batch = payroll_batch(c, [f'{year}-{number:02d}' for number in range(1, 13)])
+            sector_names={row['id']:row['name'] for row in c.execute('SELECT id,name FROM departments')}
         for month_number in range(1, 13):
             month = f'{year}-{month_number:02d}'
             data = payroll_data(m, month, batch=batch)
@@ -396,6 +398,11 @@ def _register_payroll_closing_routes(m: AppServices):
                 closed_months.append(month)
             for e in data['employees']:
                 item = consolidated.setdefault(e['id'], {'id': e['id'], 'name': e['name'], 'actual_closed': 0, 'projected_open': 0, 'fgts': 0, 'benefits': 0, 'provisions': 0, 'employer_charges': 0, 'salary': 0, 'net_closed': 0, 'net_projected': 0, 'bonuses': 0, 'inss':0, 'irrf':0, 'thirteenth':0, 'vacation':0, 'vacation_third':0, 'vacation_salary_offset':0, 'worked_hours':0, 'overtime_hours':0, 'cost_with_recorded_hours':0, 'months_with_recorded_hours':0, 'months_without_recorded_hours':0})
+                did=e['department_id']
+                sector=department_composition.setdefault(did,{'department_id':did,
+                    'name':sector_names.get(did,'Sem setor' if did is None else f'Setor histórico #{did}'),
+                    'salary':0,'benefits':0,'fgts':0,'employer_charges':0,'provisions':0,'total':0,'net_total':0})
+                sector['total']+=e['accrual_cost'];sector['net_total']+=e['net']
                 key = 'actual_closed' if data['closed'] else 'projected_open'
                 item[key] += e['accrual_cost']
                 item['net_closed' if data['closed'] else 'net_projected'] += e['net']
@@ -418,6 +425,10 @@ def _register_payroll_closing_routes(m: AppServices):
                     item[key]+=value
                 for k, value in [('fgts', e['fgts']), ('benefits', e['benefits']+e['vt_amount']-e['vt_discount']+e['va_amount']-e['va_discount']), ('provisions', e['thirteenth_provision']+e['vacation_provision']+e['provision_charges']-e['vacation_salary_offset']-e['vacation_charge_offset']), ('employer_charges', e['employer_charges']), ('salary', e['gross'])]:
                     item[k] += value
+                    sector[k] += value
+        for sector in department_composition.values():
+            for key in ('salary','benefits','fgts','employer_charges','provisions','total','net_total'):
+                sector[key]=hr.money(sector[key])
         for item in consolidated.values():
             item['total'] = item['actual_closed']+item['projected_open']
             item['net_total'] = item['net_closed']+item['net_projected']
@@ -427,7 +438,7 @@ def _register_payroll_closing_routes(m: AppServices):
             item['worked_hours']=round(item['worked_hours'],4)
             item['overtime_hours']=round(item['overtime_hours'],4)
             item['cost_per_worked_hour']=hr.money(hr.D(item['cost_with_recorded_hours'])/hr.D(item['worked_hours'])) if item['worked_hours']>0 else None
-        return {'year': year, 'closed_months': closed_months, 'employees': list(consolidated.values()), 'total_cost': hr.money(sum(hr.D(e['total']) for e in consolidated.values())), 'total_net': hr.money(sum(hr.D(e['net_total']) for e in consolidated.values())), 'basis': 'Folhas fechadas + projeção das abertas; férias provisionadas separadamente do salário.'}
+        return {'year': year, 'closed_months': closed_months, 'department_composition':list(department_composition.values()), 'employees': list(consolidated.values()), 'total_cost': hr.money(sum(hr.D(e['total']) for e in consolidated.values())), 'total_net': hr.money(sum(hr.D(e['net_total']) for e in consolidated.values())), 'basis': 'Folhas fechadas + projeção das abertas; férias provisionadas separadamente do salário.'}
 
 
 def _register_vacation_routes(m: AppServices):

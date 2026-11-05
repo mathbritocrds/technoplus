@@ -3,3 +3,5 @@
 
 .gc-donut-layout:has(>.gc-donut:only-child){justify-content:center}
 .gc-scroll:has(>.gc-line){padding-bottom:80px}
+
+.gc-series-layer{position:absolute;inset:0}.gc-series-layer .gc-segment{background:var(--series-color);height:3px}.gc-series-layer .gc-point{background:var(--series-color);border:1px solid var(--inp)}.gc-series-legend{list-style:none;display:flex;flex-wrap:wrap;gap:12px 20px;padding:0;margin:8px 0 18px;font-size:12px}.gc-series-legend li{display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}.gc-series-legend i{width:22px;height:3px;flex-shrink:0}.gc-multi-line .gc-line-label{width:88px}
