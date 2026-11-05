@@ -182,7 +182,12 @@ def payroll_data(m: AppServices, month, c=None, *, employee_id=None, live=False,
             raise HTTPException(422, str(exc))
         rules_version = table['version']
         employees = []
-        timesheet = m.timesheet_data(c, month, employee_id=employee_id)
+        if 'attendance' not in data:
+            from app.timekeeping import payroll_months
+            data['attendance']=payroll_months(c,data['months'],data['profiles'],m.local(m.utcnow()).tzinfo,
+                float(data['settings'].get('daily_hours',8)),float(data['settings'].get('weekly_hours',44)),
+                employee_id=employee_id,now=m.utcnow())
+        timesheet=data['attendance'].get(month,{})
         for employee in data['employees']:
             p = data['profiles'].get(employee['id'], hr.PROFILE_DEFAULTS)
             if not employee['active'] and not p['terminated_on']:
@@ -362,10 +367,11 @@ def _register_payroll_closing_routes(m: AppServices):
             existing = c.execute('SELECT id FROM payroll_runs WHERE month=?', (month,)).fetchone()
             if existing:
                 return {'id': existing['id'], 'already_closed': True}
-            data = payroll_data(m, month, c)
+            batch=payroll_batch(c,[month])
+            data = payroll_data(m, month, c,batch=batch)
             if not data['employees']:
                 raise HTTPException(409, 'Não é possível fechar uma folha sem funcionários elegíveis.')
-            pending = m.timesheet_data(c, month)
+            pending = batch['attendance'].get(month,{})
             if any(row.get('open') or row.get('pending_entry_ids') or row.get('anomalies') for row in pending.values()):
                 raise HTTPException(409, 'Regularize as marcações de ponto pendentes antes de fechar a folha.')
             if any(not e['profile_complete'] for e in data['employees']):

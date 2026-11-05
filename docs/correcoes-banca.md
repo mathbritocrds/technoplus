@@ -15,3 +15,13 @@ A consulta de tarefas para o ponto agora usa `POST /clock/tasks` com JSON `emplo
 As migrações SQLite são aplicadas pela aplicação. Instalações PostgreSQL devem aplicar o `supabase/schema.sql` atualizado, que inclui `tasks.assignee_external`.
 
 Regressões: `tests/test_banca_followup.py`. Verificação de interface com dados descartáveis: `scripts/qa-banca-followup.mjs`, em desenvolvimento e pacote compilado, desktop e celular.
+
+## Terceira rodada — ponto, provisões e edição de RH
+
+A folha limita os intervalos de ponto ao vínculo antes de classificar horas normais e extras. Registros originais permanecem intactos. A composição anual lê e pareia o ponto uma vez por consulta, reutilizando a apuração nas competências abertas. A seleção preserva o contexto semanal, entradas antigas ainda pendentes e a saída que conclui uma jornada após o fim do período.
+
+Horistas mantêm a provisão integral de férias e respectivos encargos; a compensação de salário já previsto nas doze mensalidades aplica-se aos mensalistas. A versão de cálculo passou a `PAYROLL-2026.5`. Folhas já fechadas conservam seus snapshots.
+
+O salvamento de RH usa o formulário que originou a solicitação. Uma resposta atrasada identifica o funcionário no aviso e não fecha nem atualiza outro formulário aberto posteriormente. Campos horistas desabilitados não enviam rascunhos inválidos; conservam os valores válidos carregados do cadastro.
+
+Regressões: `tests/test_banca3_regressions.py`, `scripts/qa-banca3-rh.mjs` e `scripts/test-payroll-pg.mjs`.

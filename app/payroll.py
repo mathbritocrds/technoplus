@@ -6,7 +6,7 @@ from decimal import Decimal, ROUND_HALF_UP
 D = lambda value: Decimal(str(value))
 ZERO = D(0)
 RULES_VERSION = 'BR-2026.3'
-CALCULATION_VERSION = 'PAYROLL-2026.4'
+CALCULATION_VERSION = 'PAYROLL-2026.5'
 PROFILE_DEFAULTS = dict(hired_on='', terminated_on='', dependents=0, alimony=0,
     other_deductions=0, vt_amount=0, vt_rate=.06, va_amount=0, va_discount=0,
     fgts_rate=.08, employer_rate=.20, vacation_days=30, variable_average=0, pay_basis='monthly', hourly_rate=0,
@@ -176,7 +176,7 @@ def calculate(employee, profile, month, overtime_hours=0, records=(), bonus_amou
     vacation_third = D(money(vacation_base / 3))
     vacation_provision = vacation_base + vacation_third
     provision_charges = D(money((thirteenth_provision+vacation_provision) * (D(p['fgts_rate'])+D(p['employer_rate']))))
-    vacation_salary_offset = vacation_base
+    vacation_salary_offset = ZERO if hourly else vacation_base
     vacation_charge_offset = D(money(vacation_salary_offset * (D(p['fgts_rate'])+D(p['employer_rate']))))
     cash_cost = gross + benefit_cash + vt-vt_discount + va-va_discount + fgts + employer
     result = {'id': employee['id'], 'name': employee['name'], 'role': employee['role'], 'department_id': employee['department_id'],
