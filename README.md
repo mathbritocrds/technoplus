@@ -7,10 +7,10 @@ Sistema integrado de gestão empresarial para controle de tarefas, matéria-prim
 
 - **Nome do Projeto:** SIGI Gestão (Sistema Integrado de Gestão)
 - **Equipe:** Techno+
-- **Curso:** Técnico em Informática / Desenvolvimento de Sistemas
-- **Instituição:** Instituição de Ensino
-- **Ano/Semestre:** 2026 / 1º Semestre
-- **Professor Orientador:** Orientador do Projeto
+- **Curso:** Técnico em Informática
+- **Instituição:** FUNEC Riacho
+- **Ano/Semestre:** 2026/2º Semestre
+- **Professor Orientador:** Rubens Palhares da Fonseca
 - **Cliente/Setor Solicitante:** Gestão Operacional, Recursos Humanos e Departamento Financeiro
 
 ## 🎯 Objetivo do Projeto
