@@ -6,7 +6,7 @@ Sistema integrado de gestão empresarial para controle de tarefas, matéria-prim
 ## 📌 Informações Gerais
 
 - **Nome do Projeto:** SIGI Gestão (Sistema Integrado de Gestão)
-- **Equipe:** Desenvolvedores SIGI
+- **Equipe:** Techno+
 - **Curso:** Técnico em Informática / Desenvolvimento de Sistemas
 - **Instituição:** Instituição de Ensino
 - **Ano/Semestre:** 2026 / 1º Semestre
