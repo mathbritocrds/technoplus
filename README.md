@@ -99,10 +99,10 @@ Um sistema web completo, modular e responsivo (com suporte offline/PWA) que cone
 
 | Nome | Função | Responsabilidade |
 | :--- | :--- | :--- |
-| **Desenvolvedor Lead** | Desenvolvedor Full-Stack | Arquitetura FastAPI, API REST, WebSocket e Regras de Custeio |
-| **Engenheiro de Dados** | DB Admin / Backend | Modelagem PostgreSQL/Supabase, RLS e Scripts de Migração |
-| **Designer / Frontend** | UI/UX & Frontend | Interfaces Kanban, PWA offline, Console React Contábil |
-| **QA & Documentação** | Testador & Documentador | Cobertura com Pytest, Validação Contábil e Redação de Docs |
+| **Matheus Brito** | Desenvolvedor Full-Stack | Arquitetura FastAPI, API REST, WebSocket e Regras de Custeio |
+| **Danthe Campidelli** | DB Admin / Backend | Modelagem PostgreSQL/Supabase, RLS e Scripts de Migração |
+| **Bernardo** | Testador | Testar funcionalidades e falhas do sistema |
+| **QA & Documentação** | Documentadoção | Cobertura com Pytest, Validação Contábil e Redação de Docs |
 
 ## 🔐 Controle de Acesso
 
