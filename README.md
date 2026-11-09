@@ -1,98 +1,147 @@
+[readme_md.md](https://github.com/user-attachments/files/34577733/readme_md.md)
 # SIGI Gestão
 
-Sistema integrado de gestão: quadros (kanban e tabela), custeio, matéria-prima, painéis de custo com DRE sintético, departamentos, espaços, folha, financeiro, integrações e ponto eletrônico com GPS no servidor.
+Sistema integrado de gestão empresarial para controle de tarefas, matéria-prima, folha de pagamento, contabilidade e ponto eletrônico com validação por GPS e IP.
 
-## Rodar
+## 📌 Informações Gerais
+
+- **Nome do Projeto:** SIGI Gestão (Sistema Integrado de Gestão)
+- **Equipe:** Desenvolvedores SIGI
+- **Curso:** Técnico em Informática / Desenvolvimento de Sistemas
+- **Instituição:** Instituição de Ensino
+- **Ano/Semestre:** 2026 / 1º Semestre
+- **Professor Orientador:** Orientador do Projeto
+- **Cliente/Setor Solicitante:** Gestão Operacional, Recursos Humanos e Departamento Financeiro
+
+## 🎯 Objetivo do Projeto
+
+Desenvolver uma solução web integrada para centralizar a gestão operacional e financeira de empresas, permitindo o acompanhamento de tarefas (Kanban/Tabela), automação de custeio por projeto, controle de estoque de matéria-prima, cálculo da folha de pagamento, registro de ponto com geolocalização e emissão de relatórios contábeis em partidas dobradas.
+
+## 👥 Público-Alvo
+
+- **Administradores:** Liderança executiva com controle total sobre configurações, usuários, finanças e auditoria.
+- **Gestores:** Responsáveis por departamentos encarregados do acompanhamento de quadros, aprovação de tarefas e gestão de espaços.
+- **Operadores:** Colaboradores operacionais que visualizam e atualizam quadros de trabalho e tarefas.
+- **Funcionários:** Colaboradores da empresa que realizam marcações de ponto eletrônico e acessam o canal de comunicação interna.
+
+## 🧩 Problema a Ser Resolvido
+
+A descentralização das informações operacionais e financeiras em planilhas ou sistemas isolados gera inconsistência de dados, falta de rastreabilidade do custo real por tarefa, atrasos na reposição de insumos e dificuldades no cálculo exato da folha e demonstrações contábeis (DRE e Balanço).
+
+## 💡 Solução Proposta
+
+Um sistema web completo, modular e responsivo (com suporte offline/PWA) que conecta o registro de ponto do colaborador diretamente ao custeio de mão de obra das tarefas, automatiza a baixa de estoques, gera DRE sintético/analítico em tempo real e permite a contabilidade em partidas dobradas com auditoria completa das operações.
+
+## ⚙️ Funcionalidades do Sistema
+
+### Funcionalidades Principais
+
+- **Autenticação e Segurança:** Login por usuário ou e-mail, autenticação de dois fatores (2FA/TOTP), controle de acesso baseado em funções (RBAC) e auditoria de ações de escrita da API.
+- **Gestão de Quadros e Tarefas:** Visualização em Kanban e Tabela, anexos (até 6 MB), checklists com progresso, tags, prazos e regras de automação por custo/progresso.
+- **Ponto Eletrônico e RH:** Marcação de ponto com validação por GPS e restrição opcional por faixa de IP (CIDR), apuração de horas extras e fechamento de folha de pagamento.
+- **Gestão de Matéria-Prima e Custeio:** Cadastro de estoque com limite mínimo, baixa automática de insumos ao iniciar tarefas e apuração de mão de obra via ponto.
+- **Módulo Financeiro e Contábil:** DRE sintético/analítico (até 15 níveis), Balanço Patrimonial, Balancete, lançamentos em partidas dobradas, conciliação e exportação em CSV.
+- **Reserva de Espaços:** Calendário compartilhado para agendamento de salas e bancadas com bloqueio de conflitos de horários.
+- **Comunicação e Notificações:** Canal de avisos gerais, mensagens privadas entre gestão e funcionários, além de alertas por E-mail (SMTP) e WhatsApp Cloud API.
+- **Suporte Offline (PWA) e WebSocket:** Sincronização offline para tarefas/materiais e atualizações em tempo real para painéis e quadros.
+
+## 🛠️ Tecnologias Utilizadas
+
+- **Front-end:** HTML5, CSS3, JavaScript / React (Módulo Contábil), Tailwind CSS, PWA (IndexedDB e Service Workers)
+- **Back-end:** Python, FastAPI, Uvicorn
+- **Banco de Dados:** SQLite (`data/flux.db`) para desenvolvimento local; PostgreSQL / Supabase para produção (com Row Level Security - RLS)
+- **Versionamento & Ferramentas:** Git, GitHub, Pytest, Node.js / npm
+
+## 🗂️ Estrutura do Projeto
+
+```text
+/sigi-gestao
+│
+├── app/                  # Código-fonte principal da aplicação FastAPI
+├── docs/                 # Documentação técnica e arquitetural dos módulos
+├── scripts/              # Scripts de migração de banco e testes em PG
+├── supabase/             # Schemas SQL e políticas de RLS para PostgreSQL
+├── tests/                # Testes automatizados (pytest)
+├── requirements.txt      # Dependências em Python (produção)
+├── requirements-dev.txt  # Dependências em Python (desenvolvimento)
+├── package.json          # Scripts e dependências de frontend / React
+└── README.md             # Documentação principal do repositório
+```
+
+## 🧪 Requisitos Funcionais
+
+- **RF01 – Autenticação:** O sistema deve permitir o login de administradores, gestores, operadores e funcionários com senha com hash seguro e suporte opcional a 2FA.
+- **RF02 – Gestão de Tarefas:** O sistema deve permitir criar, editar, mover e aprovar tarefas nos modos Kanban e Tabela.
+- **RF03 – Ponto Eletrônico:** O sistema deve registrar marcações de entrada e saída validando as coordenadas de GPS do cliente e a faixa de IP configurada.
+- **RF04 – Baixa de Matéria-Prima:** O sistema deve realizar a baixa automática do saldo de matéria-prima associada ao card ao transicioná-lo da coluna "A fazer".
+- **RF05 – Cálculo de Custeio:** O sistema deve calcular o custo de mão de obra da tarefa multiplicando o tempo registrado no ponto pela taxa horária do colaborador.
+- **RF06 – Demonstrações Financeiras:** O sistema deve gerar DRE sintético/analítico, Balanço Patrimonial e Balancete por período e setor.
+- **RF07 – Agendamento de Espaços:** O sistema deve permitir a reserva de salas e recursos impedindo agendamentos em horários conflitantes.
+
+## 🚫 Requisitos Não Funcionais
+
+- **RNF01 – Acessibilidade:** O sistema deve ser acessível via navegadores modernos de desktop e dispositivos móveis.
+- **RNF02 – Desempenho:** O painel principal e as métricas operacionais devem atualizar automaticamente a cada 30 segundos ou via eventos WebSocket.
+- **RNF03 – Segurança:** O sistema não deve expor credenciais no código, deve aplicar limite de tentativas no ponto (anti-brute force) e sanitizar exportações CSV contra fórmula injection.
+- **RNF04 – Disponibilidade Offline:** A interface de quadros e estoque deve manter suporte de leitura e enfileiramento de edições via PWA (IndexedDB) em caso de queda de conexão.
+
+## 📅 Cronograma do Projeto
+
+| Etapa | Descrição | Responsável | Data |
+| :--- | :--- | :--- | :--- |
+| 1 | Levantamento de Requisitos e Regras de Negócio | Equipe SIGI | Concluído |
+| 2 | Modelagem de Banco de Dados e Arquitetura | Equipe SIGI | Concluído |
+| 3 | Desenvolvimento do Core (FastAPI, SQLite, Kanban) | Equipe SIGI | Concluído |
+| 4 | Módulos de Ponto GPS, DRE, RH e Contabilidade | Equipe SIGI | Concluído |
+| 5 | Testes Automatizados, Migração Supabase e Ajustes | Equipe SIGI | Concluído |
+
+## 🧑‍💻 Integrantes da Equipe
+
+| Nome | Função | Responsabilidade |
+| :--- | :--- | :--- |
+| **Desenvolvedor Lead** | Desenvolvedor Full-Stack | Arquitetura FastAPI, API REST, WebSocket e Regras de Custeio |
+| **Engenheiro de Dados** | DB Admin / Backend | Modelagem PostgreSQL/Supabase, RLS e Scripts de Migração |
+| **Designer / Frontend** | UI/UX & Frontend | Interfaces Kanban, PWA offline, Console React Contábil |
+| **QA & Documentação** | Testador & Documentador | Cobertura com Pytest, Validação Contábil e Redação de Docs |
+
+## 🔐 Controle de Acesso
+
+- **Administrador:** Acesso irrestrito a todos os módulos, configurações de segurança (2FA, IP/CIDR), permissões de usuários e auditoria.
+- **Gestor:** Leitura e edição de quadros e tarefas do próprio setor, reserva de espaços em nome do departamento e aprovação de entregas.
+- **Operador:** Visualização e atualização de progresso de quadros e checklists.
+- **Funcionário:** Acesso exclusivo ao terminal de ponto eletrônico, mensagens da equipe e consulta de comprovantes.
+
+## 📷 Protótipos / Telas
+
+Consulte os guias visuais e documentos de arquitetura das telas nos links:
+- [Documentação do Módulo RH e Eventos](docs/modulos-rh-financeiro-eventos.md)
+- [Documentação da Arquitetura Contábil](docs/contabilidade-cpc51-arquitetura.md)
+- [Documentação de Controles Corporativos](docs/controles-corporativos.md)
+
+## 📦 Como Executar o Projeto
+
+### 1. Clonar e preparar o ambiente
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+git clone https://github.com/seu-usuario/sigi-gestao.git
+cd sigi-gestao
+
+python -m venv .venv
+source .venv/bin/activate  # No Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+### 2. Rodar a aplicação
+
+```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-Na primeira execução, use **Criar conta da empresa** na tela de login para cadastrar o nome de usuário do administrador, e-mail e senha. O nome da empresa e o CNPJ são opcionais. O administrador pode editar o nome de usuário, e-mail e senha em **Segurança**, confirmando a senha atual; o nome de usuário ou e-mail pode ser usado para entrar. Para instalações já configuradas, o atalho de login solicita a autenticação de um administrador para autorizar novos acessos da mesma empresa. Senhas são armazenadas com hash; não há credenciais padrão para instalações novas.
+Acesse a aplicação no seu navegador em `http://localhost:8080`. No primeiro acesso, selecione **Criar conta da empresa** para cadastrar o usuário Administrador inicial.
 
-## O que foi acrescentado (SIGI)
-
-- **DRE sintético** no painel: receita bruta, consumo de matéria-prima, custos operacionais + impostos e lucro líquido grosso com margem.
-- **Inteligência operacional** no painel: composição financeira, presença dos últimos 14 dias, horas do mês com marcações abertas atualizadas ao vivo e alertas automáticos de estoque, tarefas críticas/atrasadas e horas extras. O painel atualiza a cada 30 segundos; horas extras geram alerta a partir de 8 h por funcionário no mês.
-- **Quadros em tabela**: item, status (crítico/atenção/ok), prioridade, prazo, progresso, aprovação e responsável — além do kanban.
-- **Matéria-prima** com estoque, valor e limite mínimo configurável por item para alertas de reposição.
-- **Painéis de custo** que consolidam o DRE.
-- **Departamentos** e **espaços** (vínculo de e-mail de administrador).
-- **Integrações** (webhook, CSV, WhatsApp, ERP).
-- **Custeio mensal por setor**: consolida despesas pagas, em aberto e folha por competência.
-- **Exportação financeira em CSV** para contas a pagar e receber, com neutralização de fórmulas em campos de texto.
-- **Funcionários**: cadastro na tela de Folha e exportação autenticada da lista em CSV.
-- **Contas de usuário**: o administrador pode entrar com nome de usuário ou e-mail; somente um administrador autenticado pode criar acessos adicionais na mesma instalação.
-- **Acesso por função**: Administrador tem controle total; Gestor consulta quadros e decide aprovações; Operador tem acesso de leitura aos quadros. Administradores podem alterar as funções em Segurança.
-- **Gestão de tarefas**: arraste cards entre etapas no Kanban ou altere-as na tabela; cada card tem checklist com progresso, tags, anexos (PDF/JPEG/PNG/WebP, até 6 MB) e histórico de alterações. Gestores veem tarefas do próprio departamento e tarefas compartilhadas sem departamento.
-- **Custeio por tarefa**: associe a tarefa em andamento à entrada e à saída do ponto para apurar horas e custo de mão de obra. A taxa horária é congelada no registro, usando salário mensal dividido por 220 horas. Insumos podem ser vinculados ao card e são baixados uma única vez quando ele sai de “A fazer”; falta de saldo impede a movimentação.
-- **Automações de quadro**: regras configuráveis para pedir aprovação quando o progresso chega a 100% ou avisar quando o custo real ultrapassa o teto do card. Cada regra dispara uma vez por tarefa; os avisos usam os canais ativos configurados em Segurança.
-- **Filtros e exportação do quadro**: combine etapa, prioridade, severidade, aprovação, departamento e busca; salve combinações neste navegador. Exporte CSV compatível com Excel ou use a impressão do navegador para salvar em PDF.
-- **Busca e comandos rápidos**: `Ctrl+K`/`Cmd+K` abre a busca e navegação; `/` abre os comandos e `N` leva à criação de tarefa.
-- **Agenda de espaços**: calendário mensal compartilhado entre departamentos para reservar salas, bancadas e recursos, com bloqueio de horários conflitantes. Gestores reservam em nome de seu departamento e podem cancelar as próprias reservas.
-- **Restrição opcional por IP no ponto**: Segurança aceita faixas CIDR. Quando configurada, o servidor exige que o IP da conexão esteja autorizado além da validação GPS habitual.
-- **Auditoria**: ações de escrita da API registram conta, horário, método, recurso, resposta HTTP e IP de conexão; a tela Segurança exibe as ações recentes.
-- **Autenticação em duas etapas**: configure TOTP em Segurança usando Google Authenticator, Authy ou outro aplicativo compatível. A chave é guardada no banco e o login exige o código após a ativação.
-- **Busca global**: use `Ctrl+K` ou `Cmd+K` para localizar quadros e, como administrador, colaboradores e produtos.
-- **Offline/PWA**: o aplicativo instala como PWA e mantém a interface disponível offline. Depois de abrir os quadros ou materiais online, alterações em registros existentes podem entrar em uma fila local e sincronizam ao recuperar a conexão; cadastros novos e outros módulos continuam exigindo conexão.
-- **Eventos em tempo real**: alterações aceitas são transmitidas via WebSocket às sessões abertas na mesma instância do servidor; o painel também atualiza periodicamente.
-- **Avisos por e-mail e WhatsApp**: em Segurança, cadastre destinatários e teste o envio. Aprovações, novas tarefas críticas/atrasadas e materiais sem saldo/abaixo do mínimo disparam avisos aos canais ativos.
-- **Contas de funcionário**: a chefia pode criar e-mail e senha no cadastro de Folha. O funcionário entra pela opção Funcionário na tela inicial; sua conta não dá acesso aos dados administrativos.
-- **Comunicação da equipe**: mensagens gerais para todos e conversas privadas entre a chefia e cada funcionário. O servidor valida o acesso e mantém cada conversa privada isolada.
-- **Tema claro e escuro** com transição suave, preferência persistida no navegador e suporte ao tema do sistema.
-
-## Persistência
-
-Por padrão, o SQLite registra os dados operacionais do sistema em `data/flux.db`. Para conectar um projeto Supabase:
-
-1. Copie a connection string PostgreSQL do painel do Supabase. O aplicativo aceita os formatos `postgresql://` e o legado `postgres://`.
-2. Configure-a como segredo `SUPABASE_DATABASE_URL` no ambiente do servidor. Não compartilhe nem salve essa senha no código, no Git ou no navegador.
-3. Antes de iniciar o aplicativo conectado ao Supabase, execute `python scripts/migrate_to_supabase.py` nesse mesmo ambiente para importar os dados de `data/flux.db`.
-4. Reinicie o aplicativo. A partir daí, ele usa o Supabase; sem `SUPABASE_DATABASE_URL`, usa SQLite local.
-
-O esquema está em [`supabase/schema.sql`](supabase/schema.sql), com RLS ativado e acesso direto pela API pública do Supabase revogado para as tabelas da aplicação. A migração é transacional, preserva os IDs e para sem alterar os dados se encontrar tabelas de destino preenchidas. Faça um backup de `data/flux.db` antes de migrar.
-
-## Segurança e notificações
-
-Os administradores configuram 2FA, funções, auditoria e destinos em **Segurança**. A conta principal de administrador não pode ser rebaixada. O código TOTP é válido por janelas curtas; guarde a chave de configuração em local seguro.
-
-Reconfigurar um 2FA já ativo exige a senha e o código autenticador atuais; a proteção anterior permanece válida até confirmar o novo autenticador. A configuração pendente expira em dez minutos e aceita até cinco tentativas de confirmação. Ao alterar a senha administrativa, as outras sessões são encerradas; a sessão usada na alteração permanece ativa.
-
-O ponto limita tentativas de PIN por endereço de conexão: cinco por funcionário e 25 no total por origem, durante cinco minutos. O limite expira automaticamente e não bloqueia o funcionário nas outras origens. Os contadores ficam na memória do processo: instalações com vários processos devem usar um limitador compartilhado; dispositivos sob o mesmo endereço de rede compartilham o limite. Não confie em cabeçalhos de IP enviados pelo cliente ao configurar proxies.
-
-
-Para habilitar envios reais, configure os segredos no ambiente do servidor (nunca no navegador ou no Git):
-
-- E-mail: `SMTP_HOST`, `SMTP_PORT` (padrão `587`), `SMTP_USER`, `SMTP_PASSWORD` e `SMTP_FROM`.
-- WhatsApp Cloud API: `WHATSAPP_TOKEN` e `WHATSAPP_PHONE_ID`; cadastre o destinatário com código do país.
-
-O botão **Enviar teste** valida os canais de forma explícita. A fila offline guarda alterações pendentes no IndexedDB do navegador até sincronizar; use esse recurso somente em dispositivos confiáveis. Eventos WebSocket são locais à instância/processo e não substituem um broker compartilhado em uma implantação com várias instâncias.
-
-Anexos ficam no banco de dados e são disponibilizados apenas como download autenticado. A filtragem CIDR usa o endereço de conexão visto pelo servidor; em instalações atrás de proxy, configure o encaminhamento confiável de IP no servidor antes de ativá-la. O custo de mão de obra usa horas entre marcações de entrada/saída vinculadas ao card; períodos que atravessem tarefas devem ser registrados em pares separados para evitar atribuição incorreta.
-
-## Testes
+### 3. Executar Testes Automatizados
 
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
 ```
-
-## RH, DRE, pagamentos e eventos
-
-Consulte [arquitetura, rotas, modelo de dados e regras de cálculo](docs/modulos-rh-financeiro-eventos.md). Em Folha, configure RH/benefícios e feche a competência para gerar os salários no financeiro. Financeiro inclui DRE e comprovantes no histórico. Espaços permite eventos compatíveis dentro da capacidade e gera escalas com a equipe vinculada. O desenho original das telas foi preservado. As regras fiscais cadastradas cobrem 2026; férias e 13º têm cálculo bruto e provisões, com as limitações de liquidação descritas na documentação.
-
-`npm run build` valida e empacota a aplicação FastAPI em `dist/sigi`. `npm run preview:restart` verifica esse pacote; `npm run test:business` executa os testes Python.
-
-## Contabilidade em partidas dobradas
-
-Em **Financeiro → Contabilidade**, consulte DRE com os 15 níveis solicitados, Balanço Patrimonial e Balancete por mês, ano, intervalo e departamento. Registre lançamentos balanceados, estorne com justificativa e exporte cada demonstração em CSV. Novas contas, pagamentos e folhas fechadas alimentam o razão; a integração do histórico é explícita e pede contrapartidas para importações sem classificação patrimonial.
-
-A implementação mantém a autenticação do SIGI, aplica escopo de departamento e RLS no PostgreSQL e registra os valores anteriores e posteriores nas correções de ponto e de custos de materiais. Consulte [arquitetura, rotas, migração e validações contábeis](docs/contabilidade-cpc51-arquitetura.md).
-
-O console contábil é um módulo React incremental. `npm run build` recompila seu bundle e inclui os arquivos estáticos no pacote Python. Execute `node scripts/test-accounting-pg.mjs` para verificar as políticas e os gatilhos contábeis no PostgreSQL embarcado de testes.
-
-## Controles corporativos
-
-Consulte [complementos da folha, conciliação, encerramento contábil e revisão fiscal](docs/controles-corporativos.md) para os fluxos administrativos, parâmetros e processos externos exigidos antes do uso oficial.
